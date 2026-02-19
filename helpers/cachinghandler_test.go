@@ -5,6 +5,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/go-git/go-billy/v5"
 	"github.com/willscott/go-nfs/helpers/memfs"
 )
 
@@ -122,6 +123,72 @@ func TestCachingHandlerConcurrentInvalidateHandle(t *testing.T) {
 			for j := 0; j < numOperations; j++ {
 				sharedPath := []string{fmt.Sprintf("shared-invalidate-%d.txt", j%20)}
 				_ = cacheHandler.ToHandle(mem, sharedPath)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+}
+
+// TestCachingHandlerReflectDeepEqualRace tests for the race condition in
+// searchReverseCache where reflect.DeepEqual reads filesystem internal state
+// while another goroutine modifies it through file operations.
+//
+// The race occurs at line 108: reflect.DeepEqual(candidate.f, f)
+// reflect.DeepEqual traverses all internal fields of the filesystem objects,
+// including mutable maps that can be modified concurrently.
+//
+// Run with: go test -race -run TestCachingHandlerReflectDeepEqualRace ./helpers/
+func TestCachingHandlerReflectDeepEqualRace(t *testing.T) {
+	// Create multiple filesystem instances to trigger reflect.DeepEqual comparisons
+	const numFilesystems = 5
+	filesystems := make([]billy.Filesystem, numFilesystems)
+	for i := range filesystems {
+		filesystems[i] = memfs.New()
+	}
+
+	handler := NewNullAuthHandler(filesystems[0])
+	cacheHandler := NewCachingHandler(handler, 1024).(*CachingHandler)
+
+	const numGoroutines = 10
+	const numOperations = 100
+
+	// Pre-populate cache with handles from different filesystems
+	for _, fs := range filesystems {
+		for j := 0; j < 10; j++ {
+			path := []string{fmt.Sprintf("shared-%d.txt", j)}
+			_ = cacheHandler.ToHandle(fs, path)
+		}
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(numGoroutines * 2)
+
+	// Group 1: ToHandle calls triggering reflect.DeepEqual in searchReverseCache
+	for i := 0; i < numGoroutines; i++ {
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < numOperations; j++ {
+				fs := filesystems[j%numFilesystems]
+				path := []string{fmt.Sprintf("shared-%d.txt", j%10)}
+				_ = cacheHandler.ToHandle(fs, path)
+			}
+		}(i)
+	}
+
+	// Group 2: File operations modifying filesystem internal state
+	// This races with reflect.DeepEqual reading that state
+	for i := 0; i < numGoroutines; i++ {
+		go func(id int) {
+			defer wg.Done()
+			fs := filesystems[id%numFilesystems]
+			for j := 0; j < numOperations; j++ {
+				filename := fmt.Sprintf("/file-%d-%d.txt", id, j)
+				f, err := fs.Create(filename)
+				if err == nil {
+					_, _ = f.Write([]byte("data"))
+					_ = f.Close()
+				}
 			}
 		}(i)
 	}
