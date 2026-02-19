@@ -208,3 +208,46 @@ func TestCachingHandlerReflectDeepEqualRace(t *testing.T) {
 
 	wg.Wait()
 }
+
+// TestCachingHandlerSliceReferenceRace tests for the race condition where
+// getReverseHandles returns a slice reference that can be modified while
+// being iterated in searchReverseCache.
+//
+// The race occurs because:
+// 1. getReverseHandles returns c.reverseHandles[path] - a reference to the slice
+// 2. After releasing RLock, searchReverseCache iterates over this slice
+// 3. Concurrent appendReverseHandle/evictReverseCache modify the same slice
+//
+// Run with: go test -race -run TestCachingHandlerSliceReferenceRace ./helpers/
+func TestCachingHandlerSliceReferenceRace(t *testing.T) {
+	mem := memfs.New()
+	handler := NewNullAuthHandler(mem)
+	cacheHandler := NewCachingHandler(handler, 1024).(*CachingHandler)
+
+	const numGoroutines = 20
+	const numOperations = 500
+
+	var wg sync.WaitGroup
+	wg.Add(numGoroutines)
+
+	// All goroutines use the same small set of paths to maximize contention
+	// on the same reverseHandles slice entries
+	for i := 0; i < numGoroutines; i++ {
+		go func(id int) {
+			defer wg.Done()
+			for j := 0; j < numOperations; j++ {
+				// Use only 5 unique paths to maximize slice contention
+				path := []string{fmt.Sprintf("race-test-%d.txt", j%5)}
+				handle := cacheHandler.ToHandle(mem, path)
+
+				// Occasionally invalidate to trigger evictReverseCache
+				// while other goroutines are in searchReverseCache
+				if j%7 == 0 {
+					_ = cacheHandler.InvalidateHandle(mem, handle)
+				}
+			}
+		}(i)
+	}
+
+	wg.Wait()
+}
