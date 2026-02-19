@@ -100,9 +100,13 @@ func (c *CachingHandler) FromHandle(fh []byte) (billy.Filesystem, []string, erro
 }
 
 func (c *CachingHandler) searchReverseCache(f billy.Filesystem, path string) []byte {
-	uuids := c.getReverseHandles(path)
+	// Hold RLock for entire iteration to prevent races with appendReverseHandle
+	// and evictReverseCache which modify the slice. This is safe because
+	// activeHandles.Get() has its own internal synchronization (LRU cache).
+	c.reverseHandlesMu.RLock()
+	defer c.reverseHandlesMu.RUnlock()
 
-	for _, id := range uuids {
+	for _, id := range c.reverseHandles[path] {
 		if candidate, ok := c.activeHandles.Get(id); ok {
 			// Use interface comparison instead of reflect.DeepEqual to avoid
 			// race conditions. reflect.DeepEqual traverses all internal fields
@@ -133,12 +137,6 @@ func (c *CachingHandler) evictReverseCache(path string, handle uuid.UUID) {
 			return
 		}
 	}
-}
-
-func (c *CachingHandler) getReverseHandles(path string) []uuid.UUID {
-	c.reverseHandlesMu.RLock()
-	defer c.reverseHandlesMu.RUnlock()
-	return c.reverseHandles[path]
 }
 
 func (c *CachingHandler) appendReverseHandle(path string, id uuid.UUID) {
