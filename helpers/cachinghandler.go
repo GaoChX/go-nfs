@@ -4,7 +4,6 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"io/fs"
-	"reflect"
 	"sync"
 
 	"github.com/willscott/go-nfs"
@@ -105,7 +104,13 @@ func (c *CachingHandler) searchReverseCache(f billy.Filesystem, path string) []b
 
 	for _, id := range uuids {
 		if candidate, ok := c.activeHandles.Get(id); ok {
-			if reflect.DeepEqual(candidate.f, f) {
+			// Use interface comparison instead of reflect.DeepEqual to avoid
+			// race conditions. reflect.DeepEqual traverses all internal fields
+			// of the filesystem, including mutable maps that can be modified
+			// concurrently by file operations. Interface comparison (==) only
+			// compares type and pointer, which is sufficient for checking if
+			// it's the same filesystem instance.
+			if candidate.f == f {
 				return id[:]
 			}
 		}

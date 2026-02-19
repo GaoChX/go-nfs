@@ -138,25 +138,31 @@ func TestCachingHandlerConcurrentInvalidateHandle(t *testing.T) {
 // reflect.DeepEqual traverses all internal fields of the filesystem objects,
 // including mutable maps that can be modified concurrently.
 //
+// Note: This test uses separate filesystems per writer goroutine to avoid
+// triggering races in memfs itself (which is not thread-safe).
+//
 // Run with: go test -race -run TestCachingHandlerReflectDeepEqualRace ./helpers/
 func TestCachingHandlerReflectDeepEqualRace(t *testing.T) {
-	// Create multiple filesystem instances to trigger reflect.DeepEqual comparisons
-	const numFilesystems = 5
-	filesystems := make([]billy.Filesystem, numFilesystems)
-	for i := range filesystems {
-		filesystems[i] = memfs.New()
+	// Create filesystem instances - one shared for reads, others for writes
+	const numWriterFS = 10
+	readerFS := memfs.New()
+	writerFilesystems := make([]billy.Filesystem, numWriterFS)
+	for i := range writerFilesystems {
+		writerFilesystems[i] = memfs.New()
 	}
 
-	handler := NewNullAuthHandler(filesystems[0])
+	handler := NewNullAuthHandler(readerFS)
 	cacheHandler := NewCachingHandler(handler, 1024).(*CachingHandler)
 
 	const numGoroutines = 10
 	const numOperations = 100
 
-	// Pre-populate cache with handles from different filesystems
-	for _, fs := range filesystems {
-		for j := 0; j < 10; j++ {
-			path := []string{fmt.Sprintf("shared-%d.txt", j)}
+	// Pre-populate cache with handles from all filesystems using same paths
+	// This ensures searchReverseCache will compare different FS instances
+	for j := 0; j < 10; j++ {
+		path := []string{fmt.Sprintf("shared-%d.txt", j)}
+		_ = cacheHandler.ToHandle(readerFS, path)
+		for _, fs := range writerFilesystems {
 			_ = cacheHandler.ToHandle(fs, path)
 		}
 	}
@@ -164,24 +170,31 @@ func TestCachingHandlerReflectDeepEqualRace(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(numGoroutines * 2)
 
-	// Group 1: ToHandle calls triggering reflect.DeepEqual in searchReverseCache
+	// Group 1: ToHandle calls triggering filesystem comparisons in searchReverseCache
+	// With reflect.DeepEqual, this would race with writers modifying FS internals
 	for i := 0; i < numGoroutines; i++ {
 		go func(id int) {
 			defer wg.Done()
 			for j := 0; j < numOperations; j++ {
-				fs := filesystems[j%numFilesystems]
+				// Alternate between reader and writer filesystems
+				var fs billy.Filesystem
+				if j%2 == 0 {
+					fs = readerFS
+				} else {
+					fs = writerFilesystems[j%numWriterFS]
+				}
 				path := []string{fmt.Sprintf("shared-%d.txt", j%10)}
 				_ = cacheHandler.ToHandle(fs, path)
 			}
 		}(i)
 	}
 
-	// Group 2: File operations modifying filesystem internal state
-	// This races with reflect.DeepEqual reading that state
+	// Group 2: File operations on dedicated filesystems (one per goroutine)
+	// Each goroutine has its own filesystem to avoid memfs internal races
 	for i := 0; i < numGoroutines; i++ {
 		go func(id int) {
 			defer wg.Done()
-			fs := filesystems[id%numFilesystems]
+			fs := writerFilesystems[id%numWriterFS]
 			for j := 0; j < numOperations; j++ {
 				filename := fmt.Sprintf("/file-%d-%d.txt", id, j)
 				f, err := fs.Create(filename)
