@@ -47,7 +47,7 @@ func onCreate(ctx context.Context, w *response, userHandle Handler) error {
 		return &NFSStatusError{NFSStatusNotSupp, os.ErrInvalid}
 	}
 
-	fs, path, err := userHandle.FromHandle(obj.Handle)
+	fs, path, err := userHandle.FromHandle(ctx, obj.Handle)
 	if err != nil {
 		return &NFSStatusError{NFSStatusStale, err}
 	}
@@ -86,8 +86,8 @@ func onCreate(ctx context.Context, w *response, userHandle Handler) error {
 		return &NFSStatusError{NFSStatusAccess, err}
 	}
 
-	fp := userHandle.ToHandle(fs, newFile)
-	changer := userHandle.Change(fs)
+	fp := userHandle.ToHandle(ctx, fs, newFile)
+	changer := userHandle.Change(ctx, fs)
 	if err := attrs.Apply(changer, fs, newFilePath); err != nil {
 		Log.Errorf("Error applying attributes: %v\n", err)
 		return &NFSStatusError{NFSStatusIO, err}

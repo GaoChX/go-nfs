@@ -26,7 +26,7 @@ func onSymlink(ctx context.Context, w *response, userHandle Handler) error {
 		return &NFSStatusError{NFSStatusInval, err}
 	}
 
-	fs, path, err := userHandle.FromHandle(obj.Handle)
+	fs, path, err := userHandle.FromHandle(ctx, obj.Handle)
 	if err != nil {
 		return &NFSStatusError{NFSStatusStale, err}
 	}
@@ -53,8 +53,8 @@ func onSymlink(ctx context.Context, w *response, userHandle Handler) error {
 		return &NFSStatusError{NFSStatusAccess, err}
 	}
 
-	fp := userHandle.ToHandle(fs, append(path, string(obj.Filename)))
-	changer := userHandle.Change(fs)
+	fp := userHandle.ToHandle(ctx, fs, append(path, string(obj.Filename)))
+	changer := userHandle.Change(ctx, fs)
 	if changer != nil {
 		if err := attrs.Apply(changer, fs, newFilePath); err != nil {
 			return &NFSStatusError{NFSStatusIO, err}

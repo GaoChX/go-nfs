@@ -1,6 +1,7 @@
 package helpers
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"io/fs"
@@ -52,7 +53,7 @@ type entry struct {
 // ToHandle takes a file and represents it with an opaque handle to reference it.
 // In stateless nfs (when it's serving a unix fs) this can be the device + inode
 // but we can generalize with a stateful local cache of handed out IDs.
-func (c *CachingHandler) ToHandle(f billy.Filesystem, path []string) []byte {
+func (c *CachingHandler) ToHandle(ctx context.Context, f billy.Filesystem, path []string) []byte {
 	joinedPath := f.Join(path...)
 
 	if handle := c.searchReverseCache(f, joinedPath); handle != nil {
@@ -77,7 +78,7 @@ func (c *CachingHandler) ToHandle(f billy.Filesystem, path []string) []byte {
 }
 
 // FromHandle converts from an opaque handle to the file it represents
-func (c *CachingHandler) FromHandle(fh []byte) (billy.Filesystem, []string, error) {
+func (c *CachingHandler) FromHandle(ctx context.Context, fh []byte) (billy.Filesystem, []string, error) {
 	id, err := uuid.FromBytes(fh)
 	if err != nil {
 		return nil, []string{}, err
@@ -145,7 +146,7 @@ func (c *CachingHandler) appendReverseHandle(path string, id uuid.UUID) {
 	c.reverseHandles[path] = append(c.reverseHandles[path], id)
 }
 
-func (c *CachingHandler) InvalidateHandle(fs billy.Filesystem, handle []byte) error {
+func (c *CachingHandler) InvalidateHandle(ctx context.Context, fs billy.Filesystem, handle []byte) error {
 	//Remove from cache
 	id, _ := uuid.FromBytes(handle)
 	entry, ok := c.activeHandles.Get(id)

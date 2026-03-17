@@ -14,7 +14,7 @@ func onReadLink(ctx context.Context, w *response, userHandle Handler) error {
 	if err != nil {
 		return &NFSStatusError{NFSStatusInval, err}
 	}
-	fs, path, err := userHandle.FromHandle(handle)
+	fs, path, err := userHandle.FromHandle(ctx, handle)
 	if err != nil {
 		return &NFSStatusError{NFSStatusStale, err}
 	}

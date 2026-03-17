@@ -27,7 +27,7 @@ func onLink(ctx context.Context, w *response, userHandle Handler) error {
 		return &NFSStatusError{NFSStatusInval, err}
 	}
 
-	fs, path, err := userHandle.FromHandle(obj.Handle)
+	fs, path, err := userHandle.FromHandle(ctx, obj.Handle)
 	if err != nil {
 		return &NFSStatusError{NFSStatusStale, err}
 	}
@@ -49,8 +49,8 @@ func onLink(ctx context.Context, w *response, userHandle Handler) error {
 		return &NFSStatusError{NFSStatusNotDir, nil}
 	}
 
-	fp := userHandle.ToHandle(fs, append(path, string(obj.Filename)))
-	changer := userHandle.Change(fs)
+	fp := userHandle.ToHandle(ctx, fs, append(path, string(obj.Filename)))
+	changer := userHandle.Change(ctx, fs)
 	if changer == nil {
 		return &NFSStatusError{NFSStatusAccess, err}
 	}

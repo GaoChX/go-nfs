@@ -34,7 +34,7 @@ func onLookup(ctx context.Context, w *response, userHandle Handler) error {
 		return &NFSStatusError{NFSStatusInval, err}
 	}
 
-	fs, p, err := userHandle.FromHandle(obj.Handle)
+	fs, p, err := userHandle.FromHandle(ctx, obj.Handle)
 	if err != nil {
 		return &NFSStatusError{NFSStatusStale, err}
 	}
@@ -59,7 +59,7 @@ func onLookup(ctx context.Context, w *response, userHandle Handler) error {
 			return &NFSStatusError{NFSStatusAccess, os.ErrPermission}
 		}
 		pPath := p[0 : len(p)-1]
-		pHandle := userHandle.ToHandle(fs, pPath)
+		pHandle := userHandle.ToHandle(ctx, fs, pPath)
 		resp, err := lookupSuccessResponse(pHandle, pPath, p, fs)
 		if err != nil {
 			return &NFSStatusError{NFSStatusServerFault, err}
@@ -75,7 +75,7 @@ func onLookup(ctx context.Context, w *response, userHandle Handler) error {
 		return &NFSStatusError{NFSStatusNoEnt, os.ErrNotExist}
 	}
 
-	newHandle := userHandle.ToHandle(fs, reqPath)
+	newHandle := userHandle.ToHandle(ctx, fs, reqPath)
 	resp, err := lookupSuccessResponse(newHandle, reqPath, p, fs)
 	if err != nil {
 		return &NFSStatusError{NFSStatusServerFault, err}

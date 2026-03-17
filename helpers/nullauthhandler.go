@@ -27,7 +27,7 @@ func (h *NullAuthHandler) Mount(ctx context.Context, conn net.Conn, req nfs.Moun
 }
 
 // Change provides an interface for updating file attributes.
-func (h *NullAuthHandler) Change(fs billy.Filesystem) billy.Change {
+func (h *NullAuthHandler) Change(ctx context.Context, fs billy.Filesystem) billy.Change {
 	if c, ok := h.fs.(billy.Change); ok {
 		return c
 	}
@@ -40,16 +40,16 @@ func (h *NullAuthHandler) FSStat(ctx context.Context, f billy.Filesystem, s *nfs
 }
 
 // ToHandle handled by CachingHandler
-func (h *NullAuthHandler) ToHandle(f billy.Filesystem, s []string) []byte {
+func (h *NullAuthHandler) ToHandle(ctx context.Context, f billy.Filesystem, s []string) []byte {
 	return []byte{}
 }
 
 // FromHandle handled by CachingHandler
-func (h *NullAuthHandler) FromHandle([]byte) (billy.Filesystem, []string, error) {
+func (h *NullAuthHandler) FromHandle(context.Context, []byte) (billy.Filesystem, []string, error) {
 	return nil, []string{}, nil
 }
 
-func (c *NullAuthHandler) InvalidateHandle(billy.Filesystem, []byte) error {
+func (c *NullAuthHandler) InvalidateHandle(context.Context, billy.Filesystem, []byte) error {
 	return nil
 }
 

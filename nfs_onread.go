@@ -32,7 +32,7 @@ func onRead(ctx context.Context, w *response, userHandle Handler) error {
 	if err != nil {
 		return &NFSStatusError{NFSStatusInval, err}
 	}
-	fs, path, err := userHandle.FromHandle(obj.Handle)
+	fs, path, err := userHandle.FromHandle(ctx, obj.Handle)
 	if err != nil {
 		return &NFSStatusError{NFSStatusStale, err}
 	}

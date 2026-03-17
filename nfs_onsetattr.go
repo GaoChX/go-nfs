@@ -16,7 +16,7 @@ func onSetAttr(ctx context.Context, w *response, userHandle Handler) error {
 		return &NFSStatusError{NFSStatusInval, err}
 	}
 
-	fs, path, err := userHandle.FromHandle(handle)
+	fs, path, err := userHandle.FromHandle(ctx, handle)
 	if err != nil {
 		return &NFSStatusError{NFSStatusStale, err}
 	}
@@ -53,7 +53,7 @@ func onSetAttr(ctx context.Context, w *response, userHandle Handler) error {
 		return &NFSStatusError{NFSStatusROFS, os.ErrPermission}
 	}
 
-	changer := userHandle.Change(fs)
+	changer := userHandle.Change(ctx, fs)
 	if err := attrs.Apply(changer, fs, fs.Join(path...)); err != nil {
 		// Already an nfsstatuserror
 		return err

@@ -15,7 +15,7 @@ func onPathConf(ctx context.Context, w *response, userHandle Handler) error {
 	if err != nil {
 		return &NFSStatusError{NFSStatusInval, err}
 	}
-	fs, path, err := userHandle.FromHandle(roothandle)
+	fs, path, err := userHandle.FromHandle(ctx, roothandle)
 	if err != nil {
 		return &NFSStatusError{NFSStatusStale, err}
 	}

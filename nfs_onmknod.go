@@ -37,14 +37,14 @@ func onMknod(ctx context.Context, w *response, userHandle Handler) error {
 	}
 
 	// see if the filesystem supports mknod
-	fs, path, err := userHandle.FromHandle(obj.Handle)
+	fs, path, err := userHandle.FromHandle(ctx, obj.Handle)
 	if err != nil {
 		return &NFSStatusError{NFSStatusStale, err}
 	}
 	if !billy.CapabilityCheck(fs, billy.WriteCapability) {
 		return &NFSStatusError{NFSStatusROFS, os.ErrPermission}
 	}
-	c := userHandle.Change(fs)
+	c := userHandle.Change(ctx, fs)
 	if c == nil {
 		return &NFSStatusError{NFSStatusAccess, os.ErrPermission}
 	}
@@ -67,7 +67,7 @@ func onMknod(ctx context.Context, w *response, userHandle Handler) error {
 	} else if !parent.IsDir() {
 		return &NFSStatusError{NFSStatusNotDir, nil}
 	}
-	fp := userHandle.ToHandle(fs, append(path, string(obj.Filename)))
+	fp := userHandle.ToHandle(ctx, fs, append(path, string(obj.Filename)))
 
 	switch nfs_ftype(ftype) {
 	case FTYPE_NF3CHR:

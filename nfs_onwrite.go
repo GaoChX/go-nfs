@@ -35,7 +35,7 @@ func onWrite(ctx context.Context, w *response, userHandle Handler) error {
 		return &NFSStatusError{NFSStatusInval, err}
 	}
 
-	fs, path, err := userHandle.FromHandle(req.Handle)
+	fs, path, err := userHandle.FromHandle(ctx, req.Handle)
 	if err != nil {
 		return &NFSStatusError{NFSStatusStale, err}
 	}

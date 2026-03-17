@@ -31,11 +31,11 @@ func TestCachingHandlerConcurrentToHandle(t *testing.T) {
 				// Each goroutine creates handles for different paths
 				// but also accesses some shared paths to maximize contention
 				path := []string{fmt.Sprintf("file-%d-%d.txt", id, j)}
-				_ = cacheHandler.ToHandle(mem, path)
+				_ = cacheHandler.ToHandle(t.Context(), mem, path)
 
 				// Also access a shared path to increase contention
 				sharedPath := []string{fmt.Sprintf("shared-%d.txt", j%10)}
-				_ = cacheHandler.ToHandle(mem, sharedPath)
+				_ = cacheHandler.ToHandle(t.Context(), mem, sharedPath)
 			}
 		}(i)
 	}
@@ -57,7 +57,7 @@ func TestCachingHandlerConcurrentToHandleAndFromHandle(t *testing.T) {
 	handles := make([][]byte, 20)
 	for i := 0; i < 20; i++ {
 		path := []string{fmt.Sprintf("precreated-%d.txt", i)}
-		handles[i] = cacheHandler.ToHandle(mem, path)
+		handles[i] = cacheHandler.ToHandle(t.Context(), mem, path)
 	}
 
 	var wg sync.WaitGroup
@@ -69,7 +69,7 @@ func TestCachingHandlerConcurrentToHandleAndFromHandle(t *testing.T) {
 			defer wg.Done()
 			for j := 0; j < numOperations; j++ {
 				path := []string{fmt.Sprintf("new-file-%d-%d.txt", id, j)}
-				_ = cacheHandler.ToHandle(mem, path)
+				_ = cacheHandler.ToHandle(t.Context(), mem, path)
 			}
 		}(i)
 	}
@@ -80,7 +80,7 @@ func TestCachingHandlerConcurrentToHandleAndFromHandle(t *testing.T) {
 			defer wg.Done()
 			for j := 0; j < numOperations; j++ {
 				handle := handles[j%len(handles)]
-				_, _, _ = cacheHandler.FromHandle(handle)
+				_, _, _ = cacheHandler.FromHandle(t.Context(), handle)
 			}
 		}(i)
 	}
@@ -107,10 +107,10 @@ func TestCachingHandlerConcurrentInvalidateHandle(t *testing.T) {
 			defer wg.Done()
 			for j := 0; j < numOperations; j++ {
 				path := []string{fmt.Sprintf("invalidate-%d-%d.txt", id, j)}
-				handle := cacheHandler.ToHandle(mem, path)
+				handle := cacheHandler.ToHandle(t.Context(), mem, path)
 				// Immediately invalidate some handles
 				if j%3 == 0 {
-					_ = cacheHandler.InvalidateHandle(mem, handle)
+					_ = cacheHandler.InvalidateHandle(t.Context(), mem, handle)
 				}
 			}
 		}(i)
@@ -122,7 +122,7 @@ func TestCachingHandlerConcurrentInvalidateHandle(t *testing.T) {
 			defer wg.Done()
 			for j := 0; j < numOperations; j++ {
 				sharedPath := []string{fmt.Sprintf("shared-invalidate-%d.txt", j%20)}
-				_ = cacheHandler.ToHandle(mem, sharedPath)
+				_ = cacheHandler.ToHandle(t.Context(), mem, sharedPath)
 			}
 		}(i)
 	}
@@ -161,9 +161,9 @@ func TestCachingHandlerReflectDeepEqualRace(t *testing.T) {
 	// This ensures searchReverseCache will compare different FS instances
 	for j := 0; j < 10; j++ {
 		path := []string{fmt.Sprintf("shared-%d.txt", j)}
-		_ = cacheHandler.ToHandle(readerFS, path)
+		_ = cacheHandler.ToHandle(t.Context(), readerFS, path)
 		for _, fs := range writerFilesystems {
-			_ = cacheHandler.ToHandle(fs, path)
+			_ = cacheHandler.ToHandle(t.Context(), fs, path)
 		}
 	}
 
@@ -184,7 +184,7 @@ func TestCachingHandlerReflectDeepEqualRace(t *testing.T) {
 					fs = writerFilesystems[j%numWriterFS]
 				}
 				path := []string{fmt.Sprintf("shared-%d.txt", j%10)}
-				_ = cacheHandler.ToHandle(fs, path)
+				_ = cacheHandler.ToHandle(t.Context(), fs, path)
 			}
 		}(i)
 	}
@@ -238,12 +238,12 @@ func TestCachingHandlerSliceReferenceRace(t *testing.T) {
 			for j := 0; j < numOperations; j++ {
 				// Use only 5 unique paths to maximize slice contention
 				path := []string{fmt.Sprintf("race-test-%d.txt", j%5)}
-				handle := cacheHandler.ToHandle(mem, path)
+				handle := cacheHandler.ToHandle(t.Context(), mem, path)
 
 				// Occasionally invalidate to trigger evictReverseCache
 				// while other goroutines are in searchReverseCache
 				if j%7 == 0 {
-					_ = cacheHandler.InvalidateHandle(mem, handle)
+					_ = cacheHandler.InvalidateHandle(t.Context(), mem, handle)
 				}
 			}
 		}(i)

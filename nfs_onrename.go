@@ -19,7 +19,7 @@ func onRename(ctx context.Context, w *response, userHandle Handler) error {
 	if err != nil {
 		return &NFSStatusError{NFSStatusInval, err}
 	}
-	fs, fromPath, err := userHandle.FromHandle(from.Handle)
+	fs, fromPath, err := userHandle.FromHandle(ctx, from.Handle)
 	if err != nil {
 		return &NFSStatusError{NFSStatusStale, err}
 	}
@@ -28,7 +28,7 @@ func onRename(ctx context.Context, w *response, userHandle Handler) error {
 	if err = xdr.Read(w.req.Body, &to); err != nil {
 		return &NFSStatusError{NFSStatusInval, err}
 	}
-	fs2, toPath, err := userHandle.FromHandle(to.Handle)
+	fs2, toPath, err := userHandle.FromHandle(ctx, to.Handle)
 	if err != nil {
 		return &NFSStatusError{NFSStatusStale, err}
 	}
@@ -71,7 +71,7 @@ func onRename(ctx context.Context, w *response, userHandle Handler) error {
 	}
 	preDestData := ToFileAttribute(toDirInfo, toDirPath).AsCache()
 
-	oldHandle := userHandle.ToHandle(fs, append(fromPath, string(from.Filename)))
+	oldHandle := userHandle.ToHandle(ctx, fs, append(fromPath, string(from.Filename)))
 
 	fromLoc := fs.Join(append(fromPath, string(from.Filename))...)
 	toLoc := fs.Join(append(toPath, string(to.Filename))...)
@@ -87,7 +87,7 @@ func onRename(ctx context.Context, w *response, userHandle Handler) error {
 		return &NFSStatusError{NFSStatusIO, err}
 	}
 
-	if err := userHandle.InvalidateHandle(fs, oldHandle); err != nil {
+	if err := userHandle.InvalidateHandle(ctx, fs, oldHandle); err != nil {
 		return &NFSStatusError{NFSStatusServerFault, err}
 	}
 

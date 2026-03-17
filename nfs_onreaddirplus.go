@@ -46,12 +46,12 @@ func onReadDirPlus(ctx context.Context, w *response, userHandle Handler) error {
 		return &NFSStatusError{NFSStatusTooSmall, nil}
 	}
 
-	fs, p, err := userHandle.FromHandle(obj.Handle)
+	fs, p, err := userHandle.FromHandle(ctx, obj.Handle)
 	if err != nil {
 		return &NFSStatusError{NFSStatusStale, err}
 	}
 
-	contents, verifier, err := getDirListingWithVerifier(userHandle, obj.Handle, obj.CookieVerif)
+	contents, verifier, err := getDirListingWithVerifier(ctx, userHandle, obj.Handle, obj.CookieVerif)
 	if err != nil {
 		return err
 	}
@@ -102,7 +102,7 @@ func onReadDirPlus(ctx context.Context, w *response, userHandle Handler) error {
 			}
 
 			filePath := joinPath(p, c.Name())
-			handle := userHandle.ToHandle(fs, filePath)
+			handle := userHandle.ToHandle(ctx, fs, filePath)
 			attrs := ToFileAttribute(c, path.Join(filePath...))
 			entities = append(entities, readDirPlusEntity{
 				FileID:     attrs.Fileid,

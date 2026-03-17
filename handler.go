@@ -16,7 +16,7 @@ type Handler interface {
 
 	// Change can return 'nil' if filesystem is read-only
 	// If the returned value can be cast to `UnixChange`, mknod and link RPCs will be available.
-	Change(billy.Filesystem) billy.Change
+	Change(context.Context, billy.Filesystem) billy.Change
 
 	// Optional methods - generic helpers or trivial implementations can be sufficient depending on use case.
 
@@ -25,9 +25,9 @@ type Handler interface {
 
 	// represent file objects as opaque references
 	// Can be safely implemented via helpers/cachinghandler.
-	ToHandle(fs billy.Filesystem, path []string) []byte
-	FromHandle(fh []byte) (billy.Filesystem, []string, error)
-	InvalidateHandle(billy.Filesystem, []byte) error
+	ToHandle(cxt context.Context, fs billy.Filesystem, path []string) []byte
+	FromHandle(ctx context.Context, fh []byte) (billy.Filesystem, []string, error)
+	InvalidateHandle(context.Context, billy.Filesystem, []byte) error
 
 	// How many handles can be safely maintained by the handler.
 	HandleLimit() int

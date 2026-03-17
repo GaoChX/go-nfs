@@ -40,12 +40,12 @@ func onReadDir(ctx context.Context, w *response, userHandle Handler) error {
 		return &NFSStatusError{NFSStatusTooSmall, io.ErrShortBuffer}
 	}
 
-	fs, p, err := userHandle.FromHandle(obj.Handle)
+	fs, p, err := userHandle.FromHandle(ctx, obj.Handle)
 	if err != nil {
 		return &NFSStatusError{NFSStatusStale, err}
 	}
 
-	contents, verifier, err := getDirListingWithVerifier(userHandle, obj.Handle, obj.CookieVerif)
+	contents, verifier, err := getDirListingWithVerifier(ctx, userHandle, obj.Handle, obj.CookieVerif)
 	if err != nil {
 		return err
 	}
@@ -137,9 +137,9 @@ func onReadDir(ctx context.Context, w *response, userHandle Handler) error {
 	return nil
 }
 
-func getDirListingWithVerifier(userHandle Handler, fsHandle []byte, verifier uint64) ([]fs.FileInfo, uint64, error) {
+func getDirListingWithVerifier(ctx context.Context, userHandle Handler, fsHandle []byte, verifier uint64) ([]fs.FileInfo, uint64, error) {
 	// figure out what directory it is.
-	fs, p, err := userHandle.FromHandle(fsHandle)
+	fs, p, err := userHandle.FromHandle(ctx, fsHandle)
 	if err != nil {
 		return nil, 0, &NFSStatusError{NFSStatusStale, err}
 	}

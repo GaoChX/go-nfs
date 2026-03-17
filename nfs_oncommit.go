@@ -18,7 +18,7 @@ func onCommit(ctx context.Context, w *response, userHandle Handler) error {
 	}
 	// The conn will drain the unread offset and count arguments.
 
-	fs, path, err := userHandle.FromHandle(handle)
+	fs, path, err := userHandle.FromHandle(ctx, handle)
 	if err != nil {
 		return &NFSStatusError{NFSStatusStale, err}
 	}
