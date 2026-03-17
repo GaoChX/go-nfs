@@ -14,6 +14,9 @@ type Server struct {
 	Handler
 	ID [8]byte
 	context.Context
+
+	OnConnect    func(ctx context.Context, conn net.Conn) context.Context
+	OnDisconnect func(ctx context.Context, conn net.Conn)
 }
 
 // RegisterMessageHandler registers a handler for a specific
@@ -76,6 +79,7 @@ func (s *Server) Serve(l net.Listener) error {
 			return err
 		}
 		tempDelay = 0
+
 		c := s.newConn(conn)
 		go c.serve(baseCtx)
 	}
