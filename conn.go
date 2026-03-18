@@ -47,7 +47,7 @@ func (c *conn) serve(ctx context.Context) {
 	defer cancel()
 
 	if hook := c.OnConnect; hook != nil {
-		connCtx = hook(connCtx, c.Conn)
+		connCtx, c.Conn = hook(connCtx, c.Conn)
 	}
 
 	defer func() {

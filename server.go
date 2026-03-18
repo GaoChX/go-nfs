@@ -15,7 +15,7 @@ type Server struct {
 	ID [8]byte
 	context.Context
 
-	OnConnect    func(ctx context.Context, conn net.Conn) context.Context
+	OnConnect    func(ctx context.Context, conn net.Conn) (context.Context, net.Conn)
 	OnDisconnect func(ctx context.Context, conn net.Conn)
 }
 
