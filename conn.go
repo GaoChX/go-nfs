@@ -206,7 +206,17 @@ func (c *conn) serve(ctx context.Context) {
 	}
 
 	c.registerConn(c)
+
+	// inFlight tracks handler goroutines so teardown can wait for them before
+	// draining the caches (a worker may still hold a cached read/write fd).
+	var inFlight sync.WaitGroup
 	defer func() {
+		// Stop the serializer and unblock any worker parked on finish, then wait
+		// for every in-flight handler to return BEFORE draining: a worker may still
+		// be touching this connection's handle caches, and closing those fds out
+		// from under an active request would corrupt it.
+		cancel()
+		inFlight.Wait()
 		// Drain (close fds) before unregistering so a concurrent broadcast
 		// invalidation on another connection still visits this one while its
 		// cached fds are open; unregistering first would let a snapshot miss it
@@ -218,7 +228,22 @@ func (c *conn) serve(ctx context.Context) {
 		}
 	}()
 
-	c.writeSerializer = make(chan []byte, 1)
+	// Bound how many requests this connection processes concurrently. Reading is
+	// serial — one reader per socket pulls each RPC record off the wire in order —
+	// but handling (the disk IO) fans out to up to `limit` goroutines, so a run of
+	// pipelined requests on an nconnect mount no longer waits for each
+	// predecessor's IO to complete. This mirrors knfsd's pool of nfsd threads and
+	// nfs-ganesha's worker pool; replies are matched by XID and may return out of
+	// order, which the protocol allows.
+	limit := c.Server.MaxConcurrentRequests
+	if limit <= 0 {
+		limit = DefaultMaxConcurrentRequests
+	}
+	sem := make(chan struct{}, limit)
+
+	// Buffer the serializer to the concurrency limit so completed handlers can
+	// hand off their reply without blocking on the single socket writer.
+	c.writeSerializer = make(chan []byte, limit)
 	go c.serializeWrites(connCtx)
 
 	bio := bufio.NewReader(c.Conn)
@@ -228,24 +253,36 @@ func (c *conn) serve(ctx context.Context) {
 			if err == io.EOF {
 				// Clean close.
 				c.Close()
-				return
 			}
 			return
 		}
 		Log.Tracef("request: %v", w.req)
-		err = c.handle(connCtx, w)
-		respErr := w.finish(connCtx)
-		if err != nil {
-			Log.Errorf("error handling req: %v", err)
-			// failure to handle at a level needing to close the connection.
-			c.Close()
+
+		// Acquire a worker slot (or bail out if the connection is tearing down).
+		select {
+		case sem <- struct{}{}:
+		case <-connCtx.Done():
 			return
 		}
-		if respErr != nil {
-			Log.Errorf("error sending response: %v", respErr)
-			c.Close()
-			return
-		}
+		inFlight.Add(1)
+		go func(w *response) {
+			defer inFlight.Done()
+			defer func() { <-sem }()
+
+			if err := c.handle(connCtx, w); err != nil {
+				Log.Errorf("error handling req: %v", err)
+				// Failure at a level needing the connection closed. Cancel to stop the
+				// serializer and Close to unblock the serial reader.
+				cancel()
+				c.Close()
+				return
+			}
+			if err := w.finish(connCtx); err != nil {
+				Log.Errorf("error sending response: %v", err)
+				cancel()
+				c.Close()
+			}
+		}(w)
 	}
 }
 
@@ -448,6 +485,13 @@ func (w *response) finish(ctx context.Context) error {
 	}
 }
 
+// maxRequestSize bounds a single RPC record's length. Reading concurrently
+// means up to MaxConcurrentRequests record buffers may be live at once, so an
+// unbounded length from the wire could be used to exhaust memory. The largest
+// legitimate request is a WRITE carrying up to the advertised wtmax (1<<30)
+// plus RPC/NFS headers; this leaves generous headroom above that.
+const maxRequestSize = (1 << 30) + (1 << 16)
+
 func (c *conn) readRequestHeader(ctx context.Context, reader *bufio.Reader) (w *response, err error) {
 	fragment, err := xdr.ReadUint32(reader)
 	if err != nil {
@@ -466,14 +510,27 @@ func (c *conn) readRequestHeader(ctx context.Context, reader *bufio.Reader) (w *
 	if reqLen < 40 {
 		return nil, ErrInputInvalid
 	}
+	if reqLen > maxRequestSize {
+		return nil, ErrInputInvalid
+	}
 
-	r := io.LimitedReader{R: reader, N: int64(reqLen)}
+	// Copy the whole record off the shared socket reader into a private buffer
+	// before returning. Handlers run on worker goroutines concurrently with this
+	// loop reading the next record, so the body must NOT alias the shared
+	// bufio.Reader — each request owns its bytes (cf. knfsd's per-thread rq_arg,
+	// nfs-ganesha copying into a request buffer). A short read mid-record is a
+	// truncated/closed connection, not a clean close.
+	buf := make([]byte, reqLen)
+	if _, err := io.ReadFull(reader, buf); err != nil {
+		return nil, err
+	}
+	body := bytes.NewReader(buf)
 
-	xid, err := xdr.ReadUint32(&r)
+	xid, err := xdr.ReadUint32(body)
 	if err != nil {
 		return nil, err
 	}
-	reqType, err := xdr.ReadUint32(&r)
+	reqType, err := xdr.ReadUint32(body)
 	if err != nil {
 		return nil, err
 	}
@@ -484,9 +541,11 @@ func (c *conn) readRequestHeader(ctx context.Context, reader *bufio.Reader) (w *
 	req := request{
 		xid,
 		rpc.Header{},
-		&r,
+		// LimitedReader so response.drain's type assertion still applies; N is the
+		// bytes left after the header, i.e. the request body the handler consumes.
+		&io.LimitedReader{R: body, N: int64(body.Len())},
 	}
-	if err = xdr.Read(&r, &req.Header); err != nil {
+	if err = xdr.Read(req.Body, &req.Header); err != nil {
 		return nil, err
 	}
 

@@ -12,6 +12,12 @@ import (
 	"time"
 )
 
+// DefaultMaxConcurrentRequests is the per-connection request concurrency used
+// when Server.MaxConcurrentRequests is zero. It is a compromise between single-
+// connection throughput and bounding memory/fd pressure; embedders with many
+// connections may want it lower, those serving few high-depth mounts higher.
+const DefaultMaxConcurrentRequests = 16
+
 // Server is a handle to the listening NFS server.
 type Server struct {
 	Handler
@@ -20,6 +26,18 @@ type Server struct {
 
 	OnConnect    func(ctx context.Context, conn net.Conn) (context.Context, net.Conn)
 	OnDisconnect func(ctx context.Context, conn net.Conn)
+
+	// MaxConcurrentRequests bounds how many requests a single connection
+	// processes in parallel. A connection reads each RPC record off the wire
+	// serially (one reader per socket) but then dispatches it to a worker pool,
+	// so a run of pipelined requests — typical of an nconnect mount under load —
+	// no longer waits for each predecessor's disk IO to finish before the next is
+	// picked up. Replies are matched by XID and may return out of order, so the
+	// only ceiling on a single connection's IOPS becomes this many in-flight disk
+	// operations rather than one. Larger values raise throughput at the cost of
+	// holding that many request bodies (up to wsize each) in memory concurrently.
+	// Zero selects DefaultMaxConcurrentRequests.
+	MaxConcurrentRequests int
 
 	// conns tracks live connections so a handle-mutating op (SETATTR/REMOVE/
 	// RENAME) on one connection can invalidate cached fds for that handle on
