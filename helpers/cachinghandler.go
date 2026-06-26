@@ -24,15 +24,20 @@ func NewCachingHandlerWithVerifierLimit(h nfs.Handler, limit int, verifierLimit 
 	if limit < 2 || verifierLimit < 2 {
 		nfs.Log.Warnf("Caching handler created with insufficient cache to support directory listing", "size", limit, "verifiers", verifierLimit)
 	}
-	cache, _ := lru.New[uuid.UUID, entry](limit)
 	verifiers, _ := lru.New[uint64, verifier](verifierLimit)
-	return &CachingHandler{
+	c := &CachingHandler{
 		Handler:         h,
-		activeHandles:   cache,
 		reverseHandles:  make(map[string][]uuid.UUID),
 		activeVerifiers: verifiers,
 		cacheLimit:      limit,
 	}
+	// Register the eviction callback with the LRU itself rather than reading
+	// GetOldest before Add: the library invokes onCacheEvict with the entry it
+	// actually evicted, under its own lock, so concurrent ToHandle calls cannot
+	// make us clean up (or drop the fd for) the wrong handle.
+	c.activeHandles, _ = lru.NewWithEvict[uuid.UUID, entry](limit, c.onCacheEvict)
+
+	return c
 }
 
 // CachingHandler implements to/from handle via an LRU cache.
@@ -43,6 +48,13 @@ type CachingHandler struct {
 	reverseHandlesMu sync.RWMutex
 	activeVerifiers  *lru.Cache[uint64, verifier]
 	cacheLimit       int
+
+	// onEvict, if set by the server via SetHandleEvictionCallback, is invoked with
+	// the opaque handle of every entry evicted from activeHandles, so the server
+	// can close any per-connection fd still cached under it (see
+	// nfs.HandleEvictionReceiver). nil when the server has not registered one.
+	onEvictMu sync.RWMutex
+	onEvict   func(handle []byte)
 }
 
 type entry struct {
@@ -65,16 +77,51 @@ func (c *CachingHandler) ToHandle(ctx context.Context, f billy.Filesystem, path 
 	newPath := make([]string, len(path))
 
 	copy(newPath, path)
-	evictedKey, evictedPath, ok := c.activeHandles.GetOldest()
-	if evicted := c.activeHandles.Add(id, entry{f, newPath}); evicted && ok {
-		rk := evictedPath.f.Join(evictedPath.p...)
-		c.evictReverseCache(rk, evictedKey)
-	}
+	// Add may evict the oldest entry; onCacheEvict (registered with the LRU) runs
+	// for the entry actually evicted and handles both reverse-cache cleanup and
+	// the fd-eviction notification, so there is no GetOldest/Add race here.
+	c.activeHandles.Add(id, entry{f, newPath})
 
 	c.appendReverseHandle(joinedPath, id)
 	b, _ := id.MarshalBinary()
 
 	return b
+}
+
+// onCacheEvict is the LRU's eviction callback, invoked (outside the cache lock)
+// for the entry the cache actually removed — whether by LRU pressure during Add
+// or by an explicit Remove. It drops the entry's reverse-cache mapping and tells
+// the server to close any per-connection fd still cached under the handle, so a
+// later RENAME/REMOVE that can no longer resolve the path to this handle does not
+// leave an fd open (failing rename/remove on Windows-like backends).
+func (c *CachingHandler) onCacheEvict(id uuid.UUID, e entry) {
+	rk := e.f.Join(e.p...)
+	c.evictReverseCache(rk, id)
+	c.notifyEvicted(id)
+}
+
+// SetHandleEvictionCallback registers fn to be called with the opaque handle of
+// each entry evicted from the handle cache, so the server can close any
+// per-connection fd cached under it. Implements nfs.HandleEvictionReceiver.
+func (c *CachingHandler) SetHandleEvictionCallback(fn func(handle []byte)) {
+	c.onEvictMu.Lock()
+	defer c.onEvictMu.Unlock()
+
+	c.onEvict = fn
+}
+
+// notifyEvicted invokes the registered eviction callback (if any) with the
+// handle's wire bytes. Called after the handle has left activeHandles, with no
+// cache lock held, so the callback may freely drop fds.
+func (c *CachingHandler) notifyEvicted(id uuid.UUID) {
+	c.onEvictMu.RLock()
+	fn := c.onEvict
+	c.onEvictMu.RUnlock()
+
+	if fn != nil {
+		b, _ := id.MarshalBinary()
+		fn(b)
+	}
 }
 
 // FromHandle converts from an opaque handle to the file it represents
@@ -98,6 +145,17 @@ func (c *CachingHandler) FromHandle(ctx context.Context, fh []byte) (billy.Files
 		}
 	}
 	return nil, []string{}, &nfs.NFSStatusError{NFSStatus: nfs.NFSStatusStale}
+}
+
+// HandleForPathIfCached returns an existing handle for the given path WITHOUT
+// allocating or publishing a new one, or nil if none is currently cached. It
+// lets handle-mutating ops (RENAME) invalidate cached fds for a path without the
+// side effects of ToHandle (minting a fresh handle that a concurrent LOOKUP
+// could observe and then find stale, or evicting a live handle on a full cache).
+// A cached fd can only exist under a handle the client already looked up, so a
+// nil result means there is nothing to invalidate for that path.
+func (c *CachingHandler) HandleForPathIfCached(f billy.Filesystem, path []string) []byte {
+	return c.searchReverseCache(f, f.Join(path...))
 }
 
 func (c *CachingHandler) searchReverseCache(f billy.Filesystem, path string) []byte {
@@ -147,13 +205,10 @@ func (c *CachingHandler) appendReverseHandle(path string, id uuid.UUID) {
 }
 
 func (c *CachingHandler) InvalidateHandle(ctx context.Context, fs billy.Filesystem, handle []byte) error {
-	//Remove from cache
+	// Remove fires the LRU eviction callback (onCacheEvict) for the entry it
+	// actually removes, which drops the reverse-cache mapping and the fd, so no
+	// separate cleanup is needed here.
 	id, _ := uuid.FromBytes(handle)
-	entry, ok := c.activeHandles.Get(id)
-	if ok {
-		rk := entry.f.Join(entry.p...)
-		c.evictReverseCache(rk, id)
-	}
 	c.activeHandles.Remove(id)
 	return nil
 }

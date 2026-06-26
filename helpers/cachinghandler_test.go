@@ -1,11 +1,13 @@
 package helpers
 
 import (
+	"bytes"
 	"fmt"
 	"sync"
 	"testing"
 
 	"github.com/go-git/go-billy/v5"
+	"github.com/google/uuid"
 	"github.com/willscott/go-nfs/helpers/memfs"
 )
 
@@ -250,4 +252,105 @@ func TestCachingHandlerSliceReferenceRace(t *testing.T) {
 	}
 
 	wg.Wait()
+}
+
+// When the handle cache evicts an entry under LRU pressure, the registered
+// eviction callback must fire with that entry's opaque handle, so the server can
+// close any per-connection fd still cached under it. Without this coupling a
+// RENAME/REMOVE could no longer resolve the path to the (now-gone) handle and the
+// fd would leak until idle sweep, failing rename/remove on Windows-like backends.
+func TestHandleEvictionCallbackFiresOnLRUEviction(t *testing.T) {
+	mem := memfs.New()
+	handler := NewNullAuthHandler(mem)
+	// Small cache so a few handles force an eviction.
+	cacheHandler := NewCachingHandler(handler, 2).(*CachingHandler)
+
+	var (
+		mu      sync.Mutex
+		evicted [][]byte
+	)
+	cacheHandler.SetHandleEvictionCallback(func(h []byte) {
+		mu.Lock()
+		evicted = append(evicted, append([]byte(nil), h...))
+		mu.Unlock()
+	})
+
+	// The first handle is the LRU victim once the cache (size 2) overflows.
+	first := cacheHandler.ToHandle(t.Context(), mem, []string{"a.txt"})
+	cacheHandler.ToHandle(t.Context(), mem, []string{"b.txt"})
+	cacheHandler.ToHandle(t.Context(), mem, []string{"c.txt"}) // evicts a.txt
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(evicted) != 1 {
+		t.Fatalf("expected exactly one eviction callback, got %d", len(evicted))
+	}
+	if !bytes.Equal(evicted[0], first) {
+		t.Fatalf("eviction callback fired with %x, want evicted handle %x", evicted[0], first)
+	}
+}
+
+// With no eviction callback registered, LRU eviction must still work (the
+// callback is optional; handlers without a bounded fd coupling need none).
+func TestHandleEvictionNoCallbackSafe(t *testing.T) {
+	mem := memfs.New()
+	handler := NewNullAuthHandler(mem)
+	cacheHandler := NewCachingHandler(handler, 2).(*CachingHandler)
+
+	// No SetHandleEvictionCallback: overflowing the cache must not panic.
+	cacheHandler.ToHandle(t.Context(), mem, []string{"a.txt"})
+	cacheHandler.ToHandle(t.Context(), mem, []string{"b.txt"})
+	cacheHandler.ToHandle(t.Context(), mem, []string{"c.txt"})
+}
+
+// Under concurrent ToHandle calls that overflow a small cache, the eviction
+// callback must fire for exactly the handles the cache actually evicted — never a
+// handle still live in the cache. The previous GetOldest-then-Add approach could
+// report the wrong victim under this race (closing the wrong fd); routing through
+// the LRU's own callback fixes it. Run with -race.
+func TestHandleEvictionCallbackMatchesCacheUnderConcurrency(t *testing.T) {
+	mem := memfs.New()
+	handler := NewNullAuthHandler(mem)
+	const cacheSize = 8
+	cacheHandler := NewCachingHandler(handler, cacheSize).(*CachingHandler)
+
+	var (
+		mu      sync.Mutex
+		evicted = map[uuid.UUID]struct{}{}
+	)
+	cacheHandler.SetHandleEvictionCallback(func(h []byte) {
+		id, err := uuid.FromBytes(h)
+		if err != nil {
+			t.Errorf("callback got bad handle bytes: %v", err)
+			return
+		}
+		mu.Lock()
+		evicted[id] = struct{}{}
+		mu.Unlock()
+	})
+
+	const numGoroutines = 8
+	const numOps = 200
+	var wg sync.WaitGroup
+	wg.Add(numGoroutines)
+	for g := 0; g < numGoroutines; g++ {
+		go func(g int) {
+			defer wg.Done()
+			for j := 0; j < numOps; j++ {
+				path := []string{fmt.Sprintf("g%d-f%d.txt", g, j)}
+				cacheHandler.ToHandle(t.Context(), mem, path)
+			}
+		}(g)
+	}
+	wg.Wait()
+
+	// Every handle reported as evicted must NOT still be live in the cache: a
+	// wrong-victim notification would name a handle the cache still holds.
+	mu.Lock()
+	defer mu.Unlock()
+	for id := range evicted {
+		if _, ok := cacheHandler.activeHandles.Peek(id); ok {
+			t.Fatalf("handle %x reported evicted but still present in cache", id)
+		}
+	}
 }

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 
 	xdr2 "github.com/rasky/go-xdr/xdr2"
 	"github.com/willscott/go-nfs-client/nfs/rpc"
@@ -40,6 +41,160 @@ type conn struct {
 	*Server
 	writeSerializer chan []byte
 	net.Conn
+
+	// Per-connection handle caches. An NFS mount maps to a connection, so these
+	// are drained when the client disconnects (see serve), releasing fds
+	// promptly instead of waiting for the idle sweeper. cacheMu guards the
+	// pointers because broadcast invalidation (Server.dropHandleAll) reads them
+	// from other connections' goroutines while this connection may be lazily
+	// creating them on its first READ/WRITE.
+	cacheMu sync.Mutex
+	wc      *writeCache
+	rc      *readCache
+}
+
+// writeHandleCache returns the connection's unstable-write handle cache,
+// creating it on first use.
+func (c *conn) writeHandleCache() *writeCache {
+	c.cacheMu.Lock()
+	defer c.cacheMu.Unlock()
+
+	if c.wc == nil {
+		c.wc = newWriteCache(c.Server.commitsTracker())
+	}
+
+	return c.wc
+}
+
+// readHandleCache returns the connection's read handle cache, creating it on
+// first use.
+func (c *conn) readHandleCache() *readCache {
+	c.cacheMu.Lock()
+	defer c.cacheMu.Unlock()
+
+	if c.rc == nil {
+		c.rc = newReadCache()
+	}
+
+	return c.rc
+}
+
+// dropHandle flushes/closes any cached write and read handles for the given NFS
+// file handle. Safe to call from another connection's goroutine (broadcast
+// invalidation), so the cache pointers are read under cacheMu.
+func (c *conn) dropHandle(handle []byte) error {
+	c.cacheMu.Lock()
+	wc, rc := c.wc, c.rc
+	c.cacheMu.Unlock()
+
+	var err error
+	if wc != nil {
+		if h, done := wc.invalidate(string(handle)); h != nil {
+			// Use evictFlush, not closeFlush: like LRU/idle eviction this drop has
+			// no client to return a flush error to. If a still-dirty handle fails
+			// to close (ENOSPC/EIO), record it on the mount-wide tracker so a later
+			// COMMIT for this file (possibly on a peer connection) surfaces it
+			// instead of falsely succeeding via commitByPath.
+			lost, cerr := h.evictFlush()
+			wc.commits.finish(string(handle), done, lostErr(lost, cerr))
+			err = cerr
+		}
+	}
+	if rc != nil {
+		if h := rc.invalidate(string(handle)); h != nil {
+			if cerr := h.close(); cerr != nil && err == nil {
+				err = cerr
+			}
+		}
+	}
+
+	return err
+}
+
+// flushHandle flushes (without closing) any cached write handle for the given
+// NFS handle so its unstable writes reach stable storage, keeping the fd open
+// for further writes. Falls back to close (which also flushes) when the backing
+// file cannot Sync. Safe to call from another connection's goroutine (COMMIT
+// broadcast), so the cache pointer is read under cacheMu. Returns whether a
+// cached handle was found, so the caller can decide whether a path-level fsync
+// fallback is still needed.
+func (c *conn) flushHandle(handle []byte) (bool, error) {
+	c.cacheMu.Lock()
+	wc := c.wc
+	c.cacheMu.Unlock()
+
+	if wc == nil {
+		return false, nil
+	}
+
+	h := wc.get(string(handle))
+	if h == nil {
+		return false, nil
+	}
+
+	synced, err := h.sync()
+	if err != nil {
+		// A handle closed by a concurrent eviction was already flushed on close,
+		// so its writes are durable; only surface real sync failures.
+		if errors.Is(err, errHandleClosed) {
+			return true, nil
+		}
+		return true, err
+	}
+	if !synced {
+		// No Sync() capability: close to force a flush, then drop so the next
+		// write reopens. removeAndTrack publishes a pending marker before the
+		// handle leaves the cache, and finish records a lost-dirty close failure on
+		// the mount-wide tracker: this COMMIT returns the error now, but the handle
+		// is gone, so a retried COMMIT (or a retry after a lost error response) must
+		// still surface the loss via the tracker instead of falsely succeeding
+		// through commitByPath. Close the handle removeAndTrack actually detached:
+		// a concurrent eviction+rewrite may have replaced the one we synced, and
+		// closing the stale h would leave the live handle open, dirty, and
+		// unreachable. evictFlush records a loss only when the closed handle was
+		// still dirty.
+		if dropped, done := wc.removeAndTrack(string(handle)); dropped != nil {
+			lost, cerr := dropped.evictFlush()
+			c.Server.commitsTracker().finish(string(handle), done, lostErr(lost, cerr))
+			if cerr != nil {
+				return true, cerr
+			}
+		}
+	}
+
+	return true, nil
+}
+
+// flushDirtyHandle flushes this connection's cached write handle for the given
+// NFS handle only if it holds unflushed unstable writes, so a READ served from
+// a separate read-only fd observes them on backends that buffer until Sync/
+// Close. Safe to call from another connection's goroutine (READ broadcast), so
+// the cache pointer is read under cacheMu. Returns whether a dirty handle was
+// found and flushed.
+func (c *conn) flushDirtyHandle(handle []byte) (bool, error) {
+	c.cacheMu.Lock()
+	wc := c.wc
+	c.cacheMu.Unlock()
+
+	if wc == nil {
+		return false, nil
+	}
+
+	return wc.flushDirty(string(handle))
+}
+
+// drainCaches flushes and closes all cached handles for this connection.
+func (c *conn) drainCaches() {
+	c.cacheMu.Lock()
+	wc, rc := c.wc, c.rc
+	c.cacheMu.Unlock()
+
+	if wc != nil {
+		wc.Close()
+	}
+	if rc != nil {
+		rc.Close()
+	}
 }
 
 func (c *conn) serve(ctx context.Context) {
@@ -50,7 +205,14 @@ func (c *conn) serve(ctx context.Context) {
 		connCtx, c.Conn = hook(connCtx, c.Conn)
 	}
 
+	c.registerConn(c)
 	defer func() {
+		// Drain (close fds) before unregistering so a concurrent broadcast
+		// invalidation on another connection still visits this one while its
+		// cached fds are open; unregistering first would let a snapshot miss it
+		// and leave an fd open (failing Windows-like remove/rename).
+		c.drainCaches()
+		c.unregisterConn(c)
 		if hook := c.OnDisconnect; hook != nil {
 			hook(connCtx, c.Conn)
 		}

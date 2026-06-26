@@ -33,6 +33,35 @@ type Handler interface {
 	HandleLimit() int
 }
 
+// CachedHandleLookup is an optional Handler capability: returning an existing
+// handle for a path without allocating a new one. Handle-mutating ops (RENAME)
+// use it to invalidate cached fds for a destination path that may never have
+// been looked up, avoiding ToHandle's side effects — minting a throwaway handle
+// a concurrent LOOKUP could receive and then find stale, or evicting a live
+// handle when the handle cache is full. A nil result means no handle is cached
+// for that path, so there is nothing to invalidate. Handlers that do not
+// implement this fall back to ToHandle.
+type CachedHandleLookup interface {
+	HandleForPathIfCached(fs billy.Filesystem, path []string) []byte
+}
+
+// HandleEvictionReceiver is an optional Handler capability for handlers with a
+// bounded handle cache (e.g. helpers.CachingHandler). The server registers a
+// callback via SetHandleEvictionCallback; the handler must invoke it whenever it
+// evicts a handle from its cache. The server uses it to close any per-connection
+// read/write fd still cached under that opaque handle.
+//
+// Without this, the handle cache and the per-connection fd caches evict
+// independently: a handle dropped from the handler's cache leaves its fd open
+// until the fd cache's own idle sweep or a COMMIT. In that window a RENAME/REMOVE
+// can no longer resolve the path to that handle (CachedHandleLookup misses, since
+// the handle is gone), so it cannot drop the fd — and a Windows-like backend that
+// refuses to rename/replace an open file fails. Coupling fd lifetime to handle
+// eviction closes that window.
+type HandleEvictionReceiver interface {
+	SetHandleEvictionCallback(func(handle []byte))
+}
+
 // UnixChange extends the billy `Change` interface with support for special files.
 type UnixChange interface {
 	billy.Change

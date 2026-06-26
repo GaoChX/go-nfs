@@ -12,6 +12,7 @@ import (
 	"sort"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/go-git/go-billy/v5"
 	nfs "github.com/willscott/go-nfs"
@@ -74,6 +75,8 @@ func (t *trackingFS) OpenFile(filename string, flag int, perm os.FileMode) (bill
 	id := rand.Int63()
 	t.open[id] = OpenArgs{filename, flag, perm}
 	closer := func() {
+		t.mu.Lock()
+		defer t.mu.Unlock()
 		delete(t.open, id)
 	}
 	open = &trackingFile{
@@ -107,7 +110,18 @@ func TestNFS(t *testing.T) {
 	mem := NewTrackingFS(memfs.New())
 
 	defer func() {
-		if opened := mem.ListOpened(); len(opened) > 0 {
+		// Handles are cached per-connection and drained asynchronously when the
+		// client disconnects, so poll briefly instead of asserting immediately.
+		deadline := time.Now().Add(2 * time.Second)
+		var opened []OpenArgs
+		for time.Now().Before(deadline) {
+			opened = mem.ListOpened()
+			if len(opened) == 0 {
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		if len(opened) > 0 {
 			t.Errorf("Unclosed files: %v", opened)
 		}
 	}()

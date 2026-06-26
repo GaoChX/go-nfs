@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"os"
 	"syscall"
 )
 
@@ -243,6 +244,13 @@ func statusFromWriteError(err error) NFSStatus {
 	}
 	if errors.Is(err, syscall.EFBIG) {
 		return NFSStatusFBig
+	}
+	// A denied open of an existing file (read-only file, or permissions changed
+	// outside NFS) is a permission error, not generic I/O. os.IsPermission also
+	// catches the os.ErrPermission wrapper, so this works whether the backend
+	// returns a raw EACCES/EPERM or a *PathError.
+	if os.IsPermission(err) {
+		return NFSStatusAccess
 	}
 	return NFSStatusIO
 }
