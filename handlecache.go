@@ -157,7 +157,10 @@ func (h *cachedHandle) sync() (bool, error) {
 	if !ok {
 		return false, nil
 	}
-	if err := s.Sync(); err != nil {
+	start := time.Now()
+	err := s.Sync()
+	writeProfile.recordSync(time.Since(start).Nanoseconds())
+	if err != nil {
 		return true, err
 	}
 	h.markClean()
@@ -188,7 +191,10 @@ func (h *cachedHandle) syncIfDirty() (dirty bool, synced bool, closed bool, err 
 	if !ok {
 		return true, false, false, nil
 	}
-	if err := s.Sync(); err != nil {
+	start := time.Now()
+	err = s.Sync()
+	writeProfile.recordSync(time.Since(start).Nanoseconds())
+	if err != nil {
 		return true, true, false, err
 	}
 	h.markClean()

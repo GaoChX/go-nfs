@@ -245,6 +245,13 @@ func statusFromWriteError(err error) NFSStatus {
 	if errors.Is(err, syscall.EFBIG) {
 		return NFSStatusFBig
 	}
+	// A WRITE whose target does not exist surfaces here now that the WRITE path
+	// validates existence by opening the file (O_RDWR) rather than a pre-op path
+	// Stat. Map it to the NoEnt the pre-op Stat used to return instead of a
+	// generic I/O error.
+	if os.IsNotExist(err) {
+		return NFSStatusNoEnt
+	}
 	// A denied open of an existing file (read-only file, or permissions changed
 	// outside NFS) is a permission error, not generic I/O. os.IsPermission also
 	// catches the os.ErrPermission wrapper, so this works whether the backend

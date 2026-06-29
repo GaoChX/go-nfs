@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"os"
+	"time"
 
 	"github.com/go-git/go-billy/v5"
 	"github.com/willscott/go-nfs-client/nfs/xdr"
@@ -109,7 +110,10 @@ func commitByPath(fs billy.Filesystem, fullPath string) error {
 		return err
 	}
 	if s, ok := f.(syncer); ok {
-		if serr := s.Sync(); serr != nil {
+		start := time.Now()
+		serr := s.Sync()
+		writeProfile.recordSync(time.Since(start).Nanoseconds())
+		if serr != nil {
 			_ = f.Close()
 			return serr
 		}
