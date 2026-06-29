@@ -1,6 +1,7 @@
 package nfs
 
 import (
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -43,7 +44,7 @@ func TestWriteCacheReusesHandle(t *testing.T) {
 	if _, err := h.writeAt([]byte("hello"), 0); err != nil {
 		t.Fatalf("writeAt: %v", err)
 	}
-	if !h.dirty {
+	if !h.dirtyState() {
 		t.Fatal("expected handle to be dirty after write")
 	}
 
@@ -102,7 +103,7 @@ func TestCachedHandleSyncFlushesWithoutClose(t *testing.T) {
 	if _, err := f.WriteString("data"); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	h.dirty = true
+	h.markDirty()
 
 	synced, err := h.sync()
 	if err != nil {
@@ -111,8 +112,112 @@ func TestCachedHandleSyncFlushesWithoutClose(t *testing.T) {
 	if !synced {
 		t.Fatal("expected Sync to be supported")
 	}
-	if h.dirty {
+	if h.dirtyState() {
 		t.Fatal("expected clean after sync")
+	}
+}
+
+type blockingWriteAtFile struct {
+	billy.File
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (f *blockingWriteAtFile) WriteAt(p []byte, off int64) (int, error) {
+	f.entered <- struct{}{}
+	<-f.release
+
+	return len(p), nil
+}
+
+func TestCachedHandleWriteAtDoesNotSerializePositionalWrites(t *testing.T) {
+	f := &blockingWriteAtFile{
+		entered: make(chan struct{}, 2),
+		release: make(chan struct{}),
+	}
+	h := &cachedHandle{file: f, lastUsed: time.Now()}
+
+	done := make(chan error, 2)
+	go func() {
+		_, err := h.writeAt([]byte("first"), 0)
+		done <- err
+	}()
+
+	select {
+	case <-f.entered:
+	case <-time.After(time.Second):
+		t.Fatal("first write did not start")
+	}
+
+	go func() {
+		_, err := h.writeAt([]byte("second"), 4096)
+		done <- err
+	}()
+
+	select {
+	case <-f.entered:
+	case <-time.After(time.Second):
+		t.Fatal("second WriteAt did not start while first write was in flight")
+	}
+
+	close(f.release)
+	for i := 0; i < 2; i++ {
+		if err := <-done; err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+	}
+}
+
+type blockingSeekWriteFile struct {
+	billy.File
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (f *blockingSeekWriteFile) Seek(int64, int) (int64, error) { return 0, nil }
+
+func (f *blockingSeekWriteFile) Write(p []byte) (int, error) {
+	f.entered <- struct{}{}
+	<-f.release
+
+	return len(p), nil
+}
+
+func TestCachedHandleSeekWriteFallbackSerializesOffsetWrites(t *testing.T) {
+	f := &blockingSeekWriteFile{
+		entered: make(chan struct{}, 2),
+		release: make(chan struct{}),
+	}
+	h := &cachedHandle{file: f, lastUsed: time.Now()}
+
+	done := make(chan error, 2)
+	go func() {
+		_, err := h.writeAt([]byte("first"), 0)
+		done <- err
+	}()
+
+	select {
+	case <-f.entered:
+	case <-time.After(time.Second):
+		t.Fatal("first fallback write did not start")
+	}
+
+	go func() {
+		_, err := h.writeAt([]byte("second"), 4096)
+		done <- err
+	}()
+
+	select {
+	case <-f.entered:
+		t.Fatal("fallback Seek+Write path allowed concurrent offset writes")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(f.release)
+	for i := 0; i < 2; i++ {
+		if err := <-done; err != nil && err != io.EOF {
+			t.Fatalf("fallback write %d: %v", i, err)
+		}
 	}
 }
 

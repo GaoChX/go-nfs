@@ -354,3 +354,36 @@ func TestHandleEvictionCallbackMatchesCacheUnderConcurrency(t *testing.T) {
 		}
 	}
 }
+
+// TestFromHandleRepinsAncestors verifies the semantic preserved from upstream's
+// "re-pin to root on accesses": resolving a child handle bumps the LRU recency
+// of its ancestor directory handles, so an ancestor is not evicted from under a
+// child that is still in use. Without the re-pin, accessing only the child
+// leaves the parent as the oldest entry, so the next insertion evicts it and the
+// client is later handed a stale parent handle.
+func TestFromHandleRepinsAncestors(t *testing.T) {
+	mem := memfs.New()
+	handler := NewNullAuthHandler(mem)
+	// Cache of exactly 2 so that, with the parent and child both cached, the
+	// next insertion forces one eviction.
+	cacheHandler := NewCachingHandler(handler, 2).(*CachingHandler)
+	ctx := t.Context()
+
+	parent := cacheHandler.ToHandle(ctx, mem, []string{"dir"})
+	child := cacheHandler.ToHandle(ctx, mem, []string{"dir", "file.txt"})
+
+	// Touch the child. The re-pin must bump "dir" so it is no longer the LRU
+	// victim even though it was inserted before the child.
+	if _, _, err := cacheHandler.FromHandle(ctx, child); err != nil {
+		t.Fatalf("FromHandle(child) failed: %v", err)
+	}
+
+	// Insert a third, unrelated handle: with the cache full this evicts the LRU
+	// entry. The re-pin made the parent newer than the child, so the parent must
+	// survive (the child is the victim instead).
+	cacheHandler.ToHandle(ctx, mem, []string{"other.txt"})
+
+	if _, _, err := cacheHandler.FromHandle(ctx, parent); err != nil {
+		t.Fatalf("parent handle was evicted despite child access re-pinning it: %v", err)
+	}
+}

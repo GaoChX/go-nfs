@@ -20,6 +20,11 @@ var errHandleClosed = errors.New("cached write handle closed")
 // the handle (which also flushes) on the next eviction.
 type syncer interface{ Sync() error }
 
+// writerAt is the optional positional-write capability a billy.File may expose.
+type writerAt interface {
+	WriteAt([]byte, int64) (int, error)
+}
+
 // statter is the optional capability a billy.File may expose to fstat the open
 // fd directly. When present, the proxy builds write-cache (wcc) attributes from
 // it instead of a path-based Stat, avoiding the backing filesystem's
@@ -38,17 +43,36 @@ const defaultHandleIdle = 30 * time.Second
 // run of unstable writes to the same file reuses one fd instead of paying an
 // open+write+close (and the backing store's per-close flush) on every request.
 type cachedHandle struct {
-	mu       sync.Mutex // serializes Seek+Write and Sync on the shared fd
-	file     billy.File
+	mu sync.RWMutex // excludes Sync/Close from active positional writes
+
+	file billy.File
+
+	stateMu  sync.Mutex
 	dirty    bool      // unflushed unstable writes are present
 	lastUsed time.Time // for idle eviction
 	closed   bool
 }
 
-// writeAt seeks to offset and writes data, marking the handle dirty. The fd is
-// shared, so the seek+write pair is performed under the handle lock. (billy.File
-// has no WriterAt until v6, hence the explicit Seek.)
+// writeAt writes data at offset, marking the handle dirty. Backends exposing
+// WriteAt can process independent writes concurrently; older billy.File
+// implementations fall back to serialized Seek+Write because the fd offset is
+// shared.
 func (h *cachedHandle) writeAt(data []byte, offset int64) (int, error) {
+	if wa, ok := h.file.(writerAt); ok {
+		h.mu.RLock()
+		defer h.mu.RUnlock()
+
+		if h.closed {
+			return 0, errHandleClosed
+		}
+		n, err := wa.WriteAt(data, offset)
+		if n > 0 {
+			h.markDirty()
+		}
+
+		return n, err
+	}
+
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
@@ -60,19 +84,45 @@ func (h *cachedHandle) writeAt(data []byte, offset int64) (int, error) {
 	}
 	n, err := h.file.Write(data)
 	if n > 0 {
-		h.dirty = true
-		h.lastUsed = time.Now()
+		h.markDirty()
 	}
 
 	return n, err
+}
+
+func (h *cachedHandle) markDirty() {
+	h.stateMu.Lock()
+	h.dirty = true
+	h.lastUsed = time.Now()
+	h.stateMu.Unlock()
+}
+
+func (h *cachedHandle) markClean() {
+	h.stateMu.Lock()
+	h.dirty = false
+	h.stateMu.Unlock()
+}
+
+func (h *cachedHandle) dirtyState() bool {
+	h.stateMu.Lock()
+	defer h.stateMu.Unlock()
+
+	return h.dirty
+}
+
+func (h *cachedHandle) lastUsedState() time.Time {
+	h.stateMu.Lock()
+	defer h.stateMu.Unlock()
+
+	return h.lastUsed
 }
 
 // stat fstats the open fd if the file supports it, returning (info, true). When
 // the file has no Stat method it returns (nil, false) and the caller falls back
 // to a path-based stat.
 func (h *cachedHandle) stat() (os.FileInfo, bool) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+	h.mu.RLock()
+	defer h.mu.RUnlock()
 
 	if h.closed {
 		return nil, false
@@ -106,7 +156,7 @@ func (h *cachedHandle) sync() (bool, error) {
 	if err := s.Sync(); err != nil {
 		return true, err
 	}
-	h.dirty = false
+	h.markClean()
 
 	return true, nil
 }
@@ -127,7 +177,7 @@ func (h *cachedHandle) syncIfDirty() (dirty bool, synced bool, closed bool, err 
 	if h.closed {
 		return false, false, true, nil
 	}
-	if !h.dirty {
+	if !h.dirtyState() {
 		return false, false, false, nil
 	}
 	s, ok := h.file.(syncer)
@@ -137,7 +187,7 @@ func (h *cachedHandle) syncIfDirty() (dirty bool, synced bool, closed bool, err 
 	if err := s.Sync(); err != nil {
 		return true, true, false, err
 	}
-	h.dirty = false
+	h.markClean()
 
 	return true, true, false, nil
 }
@@ -151,7 +201,7 @@ func (h *cachedHandle) closeFlush() error {
 		return nil
 	}
 	h.closed = true
-	h.dirty = false
+	h.markClean()
 
 	return h.file.Close()
 }
@@ -169,8 +219,8 @@ func (h *cachedHandle) evictFlush() (lostDirty bool, err error) {
 		return false, nil
 	}
 	h.closed = true
-	wasDirty := h.dirty
-	h.dirty = false
+	wasDirty := h.dirtyState()
+	h.markClean()
 	err = h.file.Close()
 
 	return wasDirty && err != nil, err
@@ -393,9 +443,9 @@ func (c *writeCache) takeCommitErr(key string) error {
 
 // evictOldestLocked removes and returns the least-recently-used handle and its
 // key. The caller holds c.mu; the returned handle must be closed outside the
-// lock. Each handle's lastUsed is read under its own h.mu (as sweepIdle does),
-// because writeAt mutates lastUsed under h.mu, not c.mu — reading it bare here
-// would race a concurrent write to a different file that fills the cache.
+// lock. Each handle's lastUsed is read through its own state lock because
+// writeAt mutates lastUsed there, not under c.mu; reading it bare here would race
+// a concurrent write to a different file that fills the cache.
 func (c *writeCache) evictOldestLocked() (string, *cachedHandle) {
 	var (
 		oldestKey  string
@@ -403,9 +453,7 @@ func (c *writeCache) evictOldestLocked() (string, *cachedHandle) {
 		oldestUsed time.Time
 	)
 	for k, h := range c.entries {
-		h.mu.Lock()
-		used := h.lastUsed
-		h.mu.Unlock()
+		used := h.lastUsedState()
 		if oldest == nil || used.Before(oldestUsed) {
 			oldestKey, oldest, oldestUsed = k, h, used
 		}
@@ -512,9 +560,7 @@ func (c *writeCache) sweepIdle() {
 
 	c.mu.Lock()
 	for k, h := range c.entries {
-		h.mu.Lock()
-		idle := h.lastUsed.Before(cutoff)
-		h.mu.Unlock()
+		idle := h.lastUsedState().Before(cutoff)
 		if idle {
 			delete(c.entries, k)
 			// Mark pending under c.mu, atomically with leaving entries, so a peer

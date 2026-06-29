@@ -92,7 +92,7 @@ func onWrite(ctx context.Context, w *response, userHandle Handler) error {
 	}
 
 	var h *cachedHandle
-	writtenCount, h, err = cachedWrite(w, fs, req.Handle, fullPath, req.Data[:end], int64(req.Offset))
+	writtenCount, h, err = cachedWrite(w, fs, req.Handle, fullPath, req.Data[:end], int64(req.Offset), cached)
 	if err != nil {
 		Log.Errorf("Error writing: %v", err)
 		return &NFSStatusError{statusFromWriteError(err), err}
@@ -202,14 +202,25 @@ func statRegularFile(fs billy.Filesystem, fullPath string) (os.FileInfo, error) 
 // writes are made durable later by onCommit (or the idle sweeper); dataSync/
 // fileSync writes are flushed by the caller via the returned handle. It returns
 // the handle so the caller can fstat it for post-op attributes.
-func cachedWrite(w *response, fs billy.Filesystem, handle []byte, fullPath string, data []byte, offset int64) (int, *cachedHandle, error) {
+//
+// cachedHint is a handle the caller already looked up for this key (e.g. for the
+// pre-op wcc fstat); when non-nil it seeds the first attempt so the common
+// already-cached path takes the writeCache lock once instead of twice per WRITE.
+// It is only a hint: if it was closed by a concurrent eviction, writeAt reports
+// errHandleClosed and the retry re-fetches under the lock exactly as a cold call
+// would, so correctness does not depend on the hint being live.
+func cachedWrite(w *response, fs billy.Filesystem, handle []byte, fullPath string, data []byte, offset int64, cachedHint *cachedHandle) (int, *cachedHandle, error) {
 	cache := w.writeHandleCache()
 	key := string(handle)
 
 	// Retry once: the cached handle may be closed by eviction between lookup
 	// and write.
 	for attempt := 0; attempt < 2; attempt++ {
-		h := cache.get(key)
+		h := cachedHint
+		cachedHint = nil // only valid for the first attempt; re-fetch on retry
+		if h == nil {
+			h = cache.get(key)
+		}
 		if h == nil {
 			// Sample the invalidation generation BEFORE opening: if a concurrent
 			// SETATTR/REMOVE/RENAME/CREATE drops the handle (bumping gen) while we

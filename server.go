@@ -13,10 +13,17 @@ import (
 )
 
 // DefaultMaxConcurrentRequests is the per-connection request concurrency used
-// when Server.MaxConcurrentRequests is zero. It is a compromise between single-
-// connection throughput and bounding memory/fd pressure; embedders with many
-// connections may want it lower, those serving few high-depth mounts higher.
-const DefaultMaxConcurrentRequests = 16
+// when Server.MaxConcurrentRequests is zero. Throughput on a high-latency
+// backend is concurrency / latency (Little's law), so this is the per-connection
+// ceiling on in-flight backend operations; a single pipelined/nconnect mount
+// cannot exceed it no matter how deep the client queues.
+//
+// 64 balances that against memory: a connection retains up to this many request
+// record buffers, each pooled at maxPooledRecord (1 MiB) — so ~64 MiB worst case
+// per connection at steady state. Embedders with very many connections may want
+// it lower; those serving a few high-depth mounts (e.g. an nconnect proxy in
+// front of an object-store-backed FS) may want it higher.
+const DefaultMaxConcurrentRequests = 64
 
 // Server is a handle to the listening NFS server.
 type Server struct {

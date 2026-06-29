@@ -132,22 +132,47 @@ func (c *CachingHandler) FromHandle(ctx context.Context, fh []byte) (billy.Files
 	}
 
 	if f, ok := c.activeHandles.Get(id); ok {
-		for _, k := range c.activeHandles.Keys() {
-			candidate, _ := c.activeHandles.Peek(k)
-			if hasPrefix(f.p, candidate.p) {
-				_, _ = c.activeHandles.Get(k)
-			}
-		}
-		if ok {
-			newP := make([]string, len(f.p))
-			copy(newP, f.p)
-			return f.f, newP, nil
-		}
+		// Re-pin the LRU recency of this handle's ancestors so a parent directory
+		// handle is not evicted while a child is still in use (which would hand the
+		// client a stale parent). Resolve ancestors directly through the reverse
+		// map — O(path depth) — instead of scanning every cached entry, which made
+		// FromHandle O(N) on a hot path taken by every WRITE/READ/COMMIT and
+		// serialized concurrent requests on the cache's internal lock.
+		c.repinAncestors(f.f, f.p)
+		newP := make([]string, len(f.p))
+		copy(newP, f.p)
+		return f.f, newP, nil
 	}
 	return nil, []string{}, &nfs.NFSStatusError{NFSStatus: nfs.NFSStatusStale}
 }
 
-// HandleForPathIfCached returns an existing handle for the given path WITHOUT
+// repinAncestors bumps the LRU recency of every cached handle for a strict
+// ancestor (parent, grandparent, ...) of path, so a directory handle is not
+// evicted from under a child handle that is still being accessed. Ancestor ids
+// are gathered from the reverse-path map in O(path depth) rather than scanning
+// the whole handle cache. The reverse-map ids are collected under its read lock
+// and the lock is released before touching activeHandles, preserving the
+// activeHandles -> reverseHandlesMu lock order used by ToHandle's eviction
+// callback.
+func (c *CachingHandler) repinAncestors(f billy.Filesystem, path []string) {
+	if len(path) <= 1 {
+		return
+	}
+
+	c.reverseHandlesMu.RLock()
+	var ids []uuid.UUID
+	for i := 1; i < len(path); i++ {
+		ancestor := f.Join(path[:i]...)
+		ids = append(ids, c.reverseHandles[ancestor]...)
+	}
+	c.reverseHandlesMu.RUnlock()
+
+	for _, id := range ids {
+		_, _ = c.activeHandles.Get(id)
+	}
+}
+
+
 // allocating or publishing a new one, or nil if none is currently cached. It
 // lets handle-mutating ops (RENAME) invalidate cached fds for a path without the
 // side effects of ToHandle (minting a fresh handle that a concurrent LOOKUP
@@ -216,18 +241,6 @@ func (c *CachingHandler) InvalidateHandle(ctx context.Context, fs billy.Filesyst
 // HandleLimit exports how many file handles can be safely stored by this cache.
 func (c *CachingHandler) HandleLimit() int {
 	return c.cacheLimit
-}
-
-func hasPrefix(path, prefix []string) bool {
-	if len(prefix) > len(path) {
-		return false
-	}
-	for i, e := range prefix {
-		if path[i] != e {
-			return false
-		}
-	}
-	return true
 }
 
 type verifier struct {

@@ -10,9 +10,9 @@ import (
 	"github.com/go-git/go-billy/v5/osfs"
 )
 
-// Regression for the LRU-victim data race: writeAt mutates h.lastUsed under
-// h.mu while a concurrent write to a different file fills the cache and scans
-// lastUsed to pick a victim. evictOldestLocked must read lastUsed under h.mu.
+// Regression for the LRU-victim data race: writeAt mutates h.lastUsed while a
+// concurrent write to a different file fills the cache and scans lastUsed to pick
+// a victim. evictOldestLocked must read lastUsed through the handle state lock.
 // Run with -race; without the fix this trips the detector.
 func TestWriteCacheLRUVictimNoRace(t *testing.T) {
 	fs := osfs.New(t.TempDir())
@@ -40,7 +40,7 @@ func TestWriteCacheLRUVictimNoRace(t *testing.T) {
 					h = &cachedHandle{file: f, lastUsed: time.Now()}
 					c.put(key, h) // may evict, scanning other handles' lastUsed
 				}
-				// writeAt mutates lastUsed under h.mu, racing the eviction scan.
+				// writeAt mutates lastUsed, racing the eviction scan.
 				_, _ = h.writeAt([]byte("x"), 0)
 			}
 		}(i)

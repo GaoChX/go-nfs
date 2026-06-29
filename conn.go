@@ -268,6 +268,10 @@ func (c *conn) serve(ctx context.Context) {
 		go func(w *response) {
 			defer inFlight.Done()
 			defer func() { <-sem }()
+			// The reply is built into w.writer (independent of the record buffer), so
+			// once handle returns nothing aliases req.Body and the buffer can go back
+			// to the pool for the next request to reuse.
+			defer w.release()
 
 			if err := c.handle(connCtx, w); err != nil {
 				Log.Errorf("error handling req: %v", err)
@@ -290,7 +294,24 @@ func (c *conn) serializeWrites(ctx context.Context) {
 	// todo: maybe don't need the extra buffer
 	writer := bufio.NewWriter(c.Conn)
 	var fragmentBuf [4]byte
-	var fragmentInt uint32
+
+	// writeMsg frames and writes one reply into the buffered writer (no flush).
+	writeMsg := func(msg []byte) bool {
+		fragmentInt := uint32(len(msg)) | (1 << 31)
+		binary.BigEndian.PutUint32(fragmentBuf[:], fragmentInt)
+		if n, err := writer.Write(fragmentBuf[:]); n < 4 || err != nil {
+			return false
+		}
+		n, err := writer.Write(msg)
+		if err != nil {
+			return false
+		}
+		if n < len(msg) {
+			panic("todo: ensure writes complete fully.")
+		}
+		return true
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -299,22 +320,29 @@ func (c *conn) serializeWrites(ctx context.Context) {
 			if !ok {
 				return
 			}
-			// prepend the fragmentation header
-			fragmentInt = uint32(len(msg))
-			fragmentInt |= (1 << 31)
-			binary.BigEndian.PutUint32(fragmentBuf[:], fragmentInt)
-			n, err := writer.Write(fragmentBuf[:])
-			if n < 4 || err != nil {
+			if !writeMsg(msg) {
 				return
 			}
-			n, err = writer.Write(msg)
-			if err != nil {
-				return
+			// Coalesce flushes: with concurrent handlers many replies queue up at
+			// once, so drain everything already buffered in the channel and flush a
+			// single time rather than paying a write syscall per reply. When idle the
+			// channel is empty after one message, so this still flushes immediately.
+			drained := false
+			for !drained {
+				select {
+				case msg, ok := <-c.writeSerializer:
+					if !ok {
+						drained = true
+						break
+					}
+					if !writeMsg(msg) {
+						return
+					}
+				default:
+					drained = true
+				}
 			}
-			if n < len(msg) {
-				panic("todo: ensure writes complete fully.")
-			}
-			if err = writer.Flush(); err != nil {
+			if err := writer.Flush(); err != nil {
 				return
 			}
 		}
@@ -396,6 +424,20 @@ type response struct {
 	err       error
 	errorFmt  func(error) RPCError
 	req       *request
+	// recordBuf is the pooled buffer backing req.Body, returned to the pool by
+	// release once handling completes (the reply is built in writer, which is
+	// independent, so the record bytes are no longer needed). nil for responses
+	// constructed in tests.
+	recordBuf *[]byte
+}
+
+// release returns the request's pooled record buffer. Safe to call once, after
+// the handler has finished consuming req.Body.
+func (w *response) release() {
+	if w.recordBuf != nil {
+		putRecordBuf(w.recordBuf)
+		w.recordBuf = nil
+	}
 }
 
 func (w *response) writeXdrHeader() error {
@@ -492,6 +534,42 @@ func (w *response) finish(ctx context.Context) error {
 // plus RPC/NFS headers; this leaves generous headroom above that.
 const maxRequestSize = (1 << 30) + (1 << 16)
 
+// maxPooledRecord caps the capacity of a record buffer returned to the pool.
+// Buffers grown to serve a large WRITE (up to wtmax) are not retained, so the
+// pool's idle footprint stays bounded by the common (small) request size rather
+// than the largest one ever seen.
+const maxPooledRecord = 1 << 20
+
+// recordBufPool recycles the per-request record buffers read off the wire.
+// ntirpc reuses a per-connection input stream (svc_vc's xdrs_in) to avoid
+// allocating a buffer per request; in Go a shared buffer would race the
+// concurrent workers, so each request instead borrows a buffer from this pool
+// and returns it once handling completes (response.release). Pooling *[]byte
+// (not []byte) avoids an allocation on every Put.
+var recordBufPool = sync.Pool{New: func() any { b := []byte(nil); return &b }}
+
+// getRecordBuf returns a buffer of length n, reusing a pooled one when large
+// enough.
+func getRecordBuf(n int) *[]byte {
+	bp := recordBufPool.Get().(*[]byte)
+	if cap(*bp) < n {
+		*bp = make([]byte, n)
+	} else {
+		*bp = (*bp)[:n]
+	}
+
+	return bp
+}
+
+// putRecordBuf returns a record buffer to the pool, dropping oversized ones so
+// idle memory is not pinned at the largest WRITE seen.
+func putRecordBuf(bp *[]byte) {
+	if bp == nil || cap(*bp) > maxPooledRecord {
+		return
+	}
+	recordBufPool.Put(bp)
+}
+
 func (c *conn) readRequestHeader(ctx context.Context, reader *bufio.Reader) (w *response, err error) {
 	fragment, err := xdr.ReadUint32(reader)
 	if err != nil {
@@ -514,27 +592,33 @@ func (c *conn) readRequestHeader(ctx context.Context, reader *bufio.Reader) (w *
 		return nil, ErrInputInvalid
 	}
 
-	// Copy the whole record off the shared socket reader into a private buffer
-	// before returning. Handlers run on worker goroutines concurrently with this
-	// loop reading the next record, so the body must NOT alias the shared
-	// bufio.Reader — each request owns its bytes (cf. knfsd's per-thread rq_arg,
-	// nfs-ganesha copying into a request buffer). A short read mid-record is a
-	// truncated/closed connection, not a clean close.
-	buf := make([]byte, reqLen)
-	if _, err := io.ReadFull(reader, buf); err != nil {
+	// Copy the whole record off the shared socket reader into a pooled private
+	// buffer before returning. Handlers run on worker goroutines concurrently
+	// with this loop reading the next record, so the body must NOT alias the
+	// shared bufio.Reader — each request owns its bytes (cf. knfsd's per-thread
+	// rq_arg, nfs-ganesha's per-connection xdrs_in). The buffer is returned to the
+	// pool by response.release once handling completes; xdr decodes opaque fields
+	// (handle/data) into fresh slices, so nothing aliases it after that. A short
+	// read mid-record is a truncated/closed connection, not a clean close.
+	bufp := getRecordBuf(int(reqLen))
+	if _, err := io.ReadFull(reader, *bufp); err != nil {
+		putRecordBuf(bufp)
 		return nil, err
 	}
-	body := bytes.NewReader(buf)
+	body := bytes.NewReader(*bufp)
 
 	xid, err := xdr.ReadUint32(body)
 	if err != nil {
+		putRecordBuf(bufp)
 		return nil, err
 	}
 	reqType, err := xdr.ReadUint32(body)
 	if err != nil {
+		putRecordBuf(bufp)
 		return nil, err
 	}
 	if reqType != 0 { // 0 = request, 1 = response
+		putRecordBuf(bufp)
 		return nil, ErrInputInvalid
 	}
 
@@ -546,13 +630,15 @@ func (c *conn) readRequestHeader(ctx context.Context, reader *bufio.Reader) (w *
 		&io.LimitedReader{R: body, N: int64(body.Len())},
 	}
 	if err = xdr.Read(req.Body, &req.Header); err != nil {
+		putRecordBuf(bufp)
 		return nil, err
 	}
 
 	w = &response{
-		conn:     c,
-		req:      &req,
-		errorFmt: basicErrorFormatter,
+		conn:      c,
+		req:       &req,
+		errorFmt:  basicErrorFormatter,
+		recordBuf: bufp,
 		// TODO: use a pool for these.
 		writer: bytes.NewBuffer([]byte{}),
 	}
