@@ -22,6 +22,11 @@ type writeProfileT struct {
 	bytesWrote  atomic.Int64 // total bytes written
 	syncs       atomic.Int64 // number of Sync() calls (stable writes/COMMIT)
 	syncNs      atomic.Int64 // cumulative ns in Sync()
+
+	// onWrite segment timings, to localize non-backend time.
+	fromHandleNs atomic.Int64 // cumulative ns in userHandle.FromHandle
+	preStatNs    atomic.Int64 // cumulative ns building the pre-op wcc (fstat/path stat)
+	postStatNs   atomic.Int64 // cumulative ns building the post-op attrs (fstat/path stat)
 }
 
 var writeProfile writeProfileT
@@ -62,6 +67,9 @@ func init() {
 			"writes":             writes,
 			"avg_backend_ms":     avg(backend, writes),
 			"avg_total_ms":       avg(total, writes),
+			"avg_fromhandle_ms":  avg(writeProfile.fromHandleNs.Load(), writes),
+			"avg_prestat_ms":     avg(writeProfile.preStatNs.Load(), writes),
+			"avg_poststat_ms":    avg(writeProfile.postStatNs.Load(), writes),
 			"max_backend_ms":     float64(writeProfile.backendMax.Load()) / 1e6,
 			"backend_frac":       fracOf(backend, total),
 			"bytes":              writeProfile.bytesWrote.Load(),

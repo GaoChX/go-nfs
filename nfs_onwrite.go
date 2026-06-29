@@ -41,7 +41,9 @@ func onWrite(ctx context.Context, w *response, userHandle Handler) error {
 		return &NFSStatusError{NFSStatusInval, err}
 	}
 
+	fhStart := time.Now()
 	fs, path, err := userHandle.FromHandle(ctx, req.Handle)
+	writeProfile.fromHandleNs.Add(time.Since(fhStart).Nanoseconds())
 	if err != nil {
 		return &NFSStatusError{NFSStatusStale, err}
 	}
@@ -82,6 +84,7 @@ func onWrite(ctx context.Context, w *response, userHandle Handler) error {
 	// fstat it instead of a worker-serialized path stat. On the first write (no
 	// cached handle yet) fall back to a path stat, which also validates
 	// existence and file type before opening.
+	preStatStart := time.Now()
 	cached := w.writeHandleCache().get(string(req.Handle))
 	if cached != nil {
 		if fi, ok := cached.stat(); ok {
@@ -95,6 +98,7 @@ func onWrite(ctx context.Context, w *response, userHandle Handler) error {
 		}
 		preOpCache = ToFileAttribute(info, fullPath).AsCache()
 	}
+	writeProfile.preStatNs.Add(time.Since(preStatStart).Nanoseconds())
 
 	var h *cachedHandle
 	writtenCount, h, err = cachedWrite(w, fs, req.Handle, fullPath, req.Data[:end], int64(req.Offset), cached)
@@ -155,11 +159,13 @@ func onWrite(ctx context.Context, w *response, userHandle Handler) error {
 	}
 
 	// Build post-op wcc from an fstat on the open fd when possible.
+	postStatStart := time.Now()
 	if fi, ok := h.stat(); ok {
 		postOp = ToFileAttribute(fi, fullPath)
 	} else {
 		postOp = tryStat(fs, path)
 	}
+	writeProfile.postStatNs.Add(time.Since(postStatStart).Nanoseconds())
 
 	writer := bytes.NewBuffer([]byte{})
 	if err := xdr.Write(writer, uint32(NFSStatusOk)); err != nil {
