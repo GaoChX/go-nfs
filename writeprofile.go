@@ -36,6 +36,15 @@ type writeProfileT struct {
 	unstableWrites atomic.Int64 // number of WRITE requests asking for UNSTABLE
 	dataSyncWrites atomic.Int64 // number of WRITE requests asking for DATA_SYNC
 	fileSyncWrites atomic.Int64 // number of WRITE requests asking for FILE_SYNC
+
+	// backend write latency buckets (ns thresholds), to expose a bimodal
+	// distribution that the average hides: e.g. most writes fast but periodic
+	// multi-hundred-ms stalls (FUSE writeback-cache backpressure looks like this).
+	backendLt1ms   atomic.Int64 // < 1ms
+	backendLt10ms  atomic.Int64 // 1–10ms
+	backendLt100ms atomic.Int64 // 10–100ms
+	backendLt1s    atomic.Int64 // 100ms–1s
+	backendGe1s    atomic.Int64 // >= 1s
 }
 
 var writeProfile writeProfileT
@@ -50,6 +59,18 @@ func (p *writeProfileT) recordBackendWrite(ns int64, n int) {
 		if ns <= old || p.backendMax.CompareAndSwap(old, ns) {
 			break
 		}
+	}
+	switch {
+	case ns < 1e6:
+		p.backendLt1ms.Add(1)
+	case ns < 10e6:
+		p.backendLt10ms.Add(1)
+	case ns < 100e6:
+		p.backendLt100ms.Add(1)
+	case ns < 1e9:
+		p.backendLt1s.Add(1)
+	default:
+		p.backendGe1s.Add(1)
 	}
 }
 
@@ -114,6 +135,11 @@ func init() {
 			"avg_unaccounted_ms":            avg(unaccounted, writes),
 			"max_backend_ms":                float64(writeProfile.backendMax.Load()) / 1e6,
 			"backend_frac":                  fracOf(backend, total),
+			"backend_lt1ms":                 writeProfile.backendLt1ms.Load(),
+			"backend_1_10ms":                writeProfile.backendLt10ms.Load(),
+			"backend_10_100ms":              writeProfile.backendLt100ms.Load(),
+			"backend_100ms_1s":              writeProfile.backendLt1s.Load(),
+			"backend_ge1s":                  writeProfile.backendGe1s.Load(),
 			"bytes":                         writeProfile.bytesWrote.Load(),
 			"syncs":                         syncs,
 			"avg_sync_ms":                   avg(syncNs, syncs),
