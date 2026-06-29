@@ -103,7 +103,7 @@ func TestCachedHandleSyncFlushesWithoutClose(t *testing.T) {
 	if _, err := f.WriteString("data"); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	h.markDirty()
+	h.markDirty(4)
 
 	synced, err := h.sync()
 	if err != nil {
@@ -274,3 +274,77 @@ func TestCachedHandleRejectsWriteAfterClose(t *testing.T) {
 		t.Fatal("expected write after close to fail")
 	}
 }
+
+// TestPostOpInfoTracksSizeWithoutFstat verifies the post-op attribute fast path:
+// after a first real fstat (stat) caches the immutable fields, postOpInfo
+// reports a growing size from local write tracking (no fstat) while preserving
+// the file mode, and reflects later writes that extend the file.
+func TestPostOpInfoTracksSizeWithoutFstat(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "grow.dat")
+	osf, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o644)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer osf.Close()
+
+	// statWriteFile exposes Stat + WriteAt (like the e2b chroot wrappedFile,
+	// unlike stock osfs whose billy.File has neither), so the handle takes the
+	// fstat-caching and WriteAt paths under test.
+	h := &cachedHandle{file: statWriteFile{f: osf}, lastUsed: time.Now()}
+
+	// Before any stat, postOpInfo must miss (forces a real stat first).
+	if _, ok := h.postOpInfo(); ok {
+		t.Fatal("postOpInfo should miss before first stat")
+	}
+
+	// Write 5 bytes at offset 0, then a real stat to seed the cache.
+	if _, err := h.writeAt([]byte("hello"), 0); err != nil {
+		t.Fatalf("writeAt: %v", err)
+	}
+	fi, ok := h.stat()
+	if !ok {
+		t.Fatal("stat should succeed on osfs file")
+	}
+	if fi.Size() != 5 {
+		t.Fatalf("stat size = %d, want 5", fi.Size())
+	}
+
+	// Extend the file with a write at offset 5; postOpInfo must now report 10
+	// without an fstat, preserving the mode.
+	if _, err := h.writeAt([]byte("world"), 5); err != nil {
+		t.Fatalf("writeAt 2: %v", err)
+	}
+	pi, ok := h.postOpInfo()
+	if !ok {
+		t.Fatal("postOpInfo should hit after stat")
+	}
+	if pi.Size() != 10 {
+		t.Fatalf("postOpInfo size = %d, want 10", pi.Size())
+	}
+	if pi.Mode() != fi.Mode() {
+		t.Fatalf("postOpInfo mode = %v, want %v (immutable field must be preserved)", pi.Mode(), fi.Mode())
+	}
+
+	// A write that does not extend the file (overwrite within bounds) must not
+	// shrink the reported size.
+	if _, err := h.writeAt([]byte("HE"), 0); err != nil {
+		t.Fatalf("writeAt 3: %v", err)
+	}
+	pi, _ = h.postOpInfo()
+	if pi.Size() != 10 {
+		t.Fatalf("postOpInfo size after in-bounds write = %d, want 10", pi.Size())
+	}
+}
+
+// statWriteFile is a billy.File backed by an *os.File that exposes Stat and
+// WriteAt (the capabilities the e2b chroot wrappedFile provides and stock osfs
+// does not), for exercising the cachedHandle fstat-cache and WriteAt paths.
+type statWriteFile struct {
+	billy.File
+	f *os.File
+}
+
+func (s statWriteFile) Stat() (os.FileInfo, error)              { return s.f.Stat() }
+func (s statWriteFile) WriteAt(p []byte, off int64) (int, error) { return s.f.WriteAt(p, off) }
+func (s statWriteFile) Close() error                           { return s.f.Close() }

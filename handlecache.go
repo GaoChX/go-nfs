@@ -51,7 +51,30 @@ type cachedHandle struct {
 	dirty    bool      // unflushed unstable writes are present
 	lastUsed time.Time // for idle eviction
 	closed   bool
+
+	// cachedInfo holds the most recent fstat of this fd, used to build post-op
+	// attributes without an fstat on every WRITE (an fstat through the FUSE +
+	// wrapper chain is not free and contends with concurrent writes). The
+	// mutable fields (size, mtime) are refreshed locally from each write —
+	// statFromWrite below — while the immutable ones (mode, uid/gid, inode,
+	// nlink) are reused. nil until the first real fstat. Guarded by stateMu.
+	cachedInfo os.FileInfo
+	cachedSize int64 // best-known file size, max(stat size, offset+written)
 }
+
+// grownFileInfo wraps a cached os.FileInfo, overriding only the mutable fields
+// (size, mtime) that change as a file is written. It preserves the underlying
+// Sys() (e.g. *syscall.Stat_t), so ToFileAttribute still reads the real
+// uid/gid/inode/nlink — only size/mtime are taken from the live write tracking.
+// Used to build post-op WRITE attributes without an fstat per request.
+type grownFileInfo struct {
+	os.FileInfo
+	size    int64
+	modTime time.Time
+}
+
+func (g *grownFileInfo) Size() int64        { return g.size }
+func (g *grownFileInfo) ModTime() time.Time { return g.modTime }
 
 // writeAt writes data at offset, marking the handle dirty. Backends exposing
 // WriteAt can process independent writes concurrently; older billy.File
@@ -69,7 +92,7 @@ func (h *cachedHandle) writeAt(data []byte, offset int64) (int, error) {
 		n, err := wa.WriteAt(data, offset)
 		writeProfile.recordBackendWrite(time.Since(start).Nanoseconds(), n)
 		if n > 0 {
-			h.markDirty()
+			h.markDirty(offset + int64(n))
 		}
 
 		return n, err
@@ -88,16 +111,22 @@ func (h *cachedHandle) writeAt(data []byte, offset int64) (int, error) {
 	n, err := h.file.Write(data)
 	writeProfile.recordBackendWrite(time.Since(start).Nanoseconds(), n)
 	if n > 0 {
-		h.markDirty()
+		h.markDirty(offset + int64(n))
 	}
 
 	return n, err
 }
 
-func (h *cachedHandle) markDirty() {
+// markDirty records an unstable write, advancing the high-water size to
+// endOffset (offset+written) so post-op attributes reflect a grown file without
+// an fstat.
+func (h *cachedHandle) markDirty(endOffset int64) {
 	h.stateMu.Lock()
 	h.dirty = true
 	h.lastUsed = time.Now()
+	if endOffset > h.cachedSize {
+		h.cachedSize = endOffset
+	}
 	h.stateMu.Unlock()
 }
 
@@ -139,8 +168,37 @@ func (h *cachedHandle) stat() (os.FileInfo, bool) {
 	if err != nil {
 		return nil, false
 	}
+	// Cache the immutable attributes (mode, uid/gid, inode, nlink) for cheap
+	// post-op attribute building, and seed the high-water size.
+	h.stateMu.Lock()
+	h.cachedInfo = info
+	if sz := info.Size(); sz > h.cachedSize {
+		h.cachedSize = sz
+	}
+	h.stateMu.Unlock()
 
 	return info, true
+}
+
+// postOpInfo returns an os.FileInfo for post-op attributes without an fstat,
+// when a prior stat() has cached the fd's immutable attributes. It overlays the
+// locally-tracked high-water size and a current mtime onto that cached info, so
+// a run of WRITEs reports a correctly-growing file (size, mtime) while reusing
+// the immutable fields (mode, uid/gid, inode, nlink). Returns (nil, false) when
+// no fstat has been cached yet, so the caller does a real stat() first.
+func (h *cachedHandle) postOpInfo() (os.FileInfo, bool) {
+	h.stateMu.Lock()
+	defer h.stateMu.Unlock()
+
+	if h.closed || h.cachedInfo == nil {
+		return nil, false
+	}
+
+	return &grownFileInfo{
+		FileInfo: h.cachedInfo,
+		size:     h.cachedSize,
+		modTime:  time.Now(),
+	}, true
 }
 
 // sync flushes buffered data to stable storage if the file supports it. After a

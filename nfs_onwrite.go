@@ -186,12 +186,18 @@ func onWrite(ctx context.Context, w *response, userHandle Handler) error {
 		stability = fileSync
 	}
 
-	// Build post-op wcc from an fstat on the open fd when possible. This fstat
-	// also serves as the regular-file-type guard that the (now skipped) pre-op
-	// path Stat used to provide: a WRITE to a directory/device/etc. is rejected
+	// Build post-op attributes. Prefer the handle's locally-tracked attributes
+	// (cached immutable fstat fields + high-water size + now mtime), which avoids
+	// an fstat through the FUSE + wrapper chain on every WRITE. On the first
+	// write to a freshly-opened handle nothing is cached yet, so fall back to a
+	// real fd fstat — which also caches the immutable fields for subsequent
+	// writes and serves as the regular-file-type guard that the (now skipped)
+	// pre-op path Stat used to provide: a WRITE to a directory/device is rejected
 	// here from the fd's mode, without a path Stat.
 	postStatStart := time.Now()
-	if fi, ok := h.stat(); ok {
+	if fi, ok := h.postOpInfo(); ok {
+		postOp = ToFileAttribute(fi, fullPath)
+	} else if fi, ok := h.stat(); ok {
 		if !fi.Mode().IsRegular() {
 			writeProfile.postStatNs.Add(time.Since(postStatStart).Nanoseconds())
 			return &NFSStatusError{NFSStatusInval, os.ErrInvalid}
