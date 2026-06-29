@@ -387,3 +387,23 @@ func TestFromHandleRepinsAncestors(t *testing.T) {
 		t.Fatalf("parent handle was evicted despite child access re-pinning it: %v", err)
 	}
 }
+
+func TestFromHandleRepinsRoot(t *testing.T) {
+	mem := memfs.New()
+	handler := NewNullAuthHandler(mem)
+	cacheHandler := NewCachingHandler(handler, 2).(*CachingHandler)
+	ctx := t.Context()
+
+	root := cacheHandler.ToHandle(ctx, mem, nil)
+	child := cacheHandler.ToHandle(ctx, mem, []string{"file.txt"})
+
+	if _, _, err := cacheHandler.FromHandle(ctx, child); err != nil {
+		t.Fatalf("FromHandle(child) failed: %v", err)
+	}
+
+	cacheHandler.ToHandle(ctx, mem, []string{"other.txt"})
+
+	if _, _, err := cacheHandler.FromHandle(ctx, root); err != nil {
+		t.Fatalf("root handle was evicted despite child access re-pinning it: %v", err)
+	}
+}

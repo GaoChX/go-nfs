@@ -283,6 +283,24 @@ func (c *writeCache) get(key string) *cachedHandle {
 	return c.entries[key]
 }
 
+// isCurrent reports whether h is still the cached handle for key. Hints captured
+// before a handle invalidation must be revalidated before use, otherwise a racing
+// writer could keep using an fd that has already been detached from the cache.
+func (c *writeCache) isCurrent(key string, h *cachedHandle) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return h != nil && c.entries[key] == h
+}
+
+func (c *writeCache) getCurrent(key string, hint *cachedHandle) *cachedHandle {
+	if hint != nil && c.isCurrent(key, hint) {
+		return hint
+	}
+
+	return c.get(key)
+}
+
 // sampleGen returns the current invalidation generation. The open path samples
 // this before OpenFile and passes it to putIfFresh so an fd opened under
 // now-stale attributes is not cached after an intervening invalidation.

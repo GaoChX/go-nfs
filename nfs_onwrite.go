@@ -216,11 +216,8 @@ func cachedWrite(w *response, fs billy.Filesystem, handle []byte, fullPath strin
 	// Retry once: the cached handle may be closed by eviction between lookup
 	// and write.
 	for attempt := 0; attempt < 2; attempt++ {
-		h := cachedHint
+		h := cache.getCurrent(key, cachedHint)
 		cachedHint = nil // only valid for the first attempt; re-fetch on retry
-		if h == nil {
-			h = cache.get(key)
-		}
 		if h == nil {
 			// Sample the invalidation generation BEFORE opening: if a concurrent
 			// SETATTR/REMOVE/RENAME/CREATE drops the handle (bumping gen) while we

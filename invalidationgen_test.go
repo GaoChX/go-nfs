@@ -162,3 +162,31 @@ func TestInvalidateBumpsGenAndDetaches(t *testing.T) {
 		t.Fatalf("handle must be detached after invalidate, got %v", got)
 	}
 }
+
+func TestWriteCacheRejectsStaleHintAfterInvalidate(t *testing.T) {
+	c := newWriteCache(nil)
+	defer c.Close()
+
+	key := "hint-race-handle"
+	stale := &cachedHandle{file: closeErrFile{}, lastUsed: time.Now()}
+	c.put(key, stale)
+
+	dropped, done := c.invalidate(key)
+	if dropped != stale {
+		t.Fatalf("invalidate returned %v, want stale handle", dropped)
+	}
+	c.commits.finish(key, done, nil)
+
+	if got := c.getCurrent(key, stale); got != nil {
+		t.Fatalf("stale hint must not be reused after invalidate, got %v", got)
+	}
+
+	fresh := &cachedHandle{file: closeErrFile{}, lastUsed: time.Now()}
+	c.put(key, fresh)
+	if got := c.getCurrent(key, stale); got != fresh {
+		t.Fatalf("stale hint should refetch current handle: got %v want %v", got, fresh)
+	}
+	if got := c.getCurrent(key, fresh); got != fresh {
+		t.Fatalf("current hint not accepted: got %v want %v", got, fresh)
+	}
+}

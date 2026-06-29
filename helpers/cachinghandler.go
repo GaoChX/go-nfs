@@ -146,22 +146,17 @@ func (c *CachingHandler) FromHandle(ctx context.Context, fh []byte) (billy.Files
 	return nil, []string{}, &nfs.NFSStatusError{NFSStatus: nfs.NFSStatusStale}
 }
 
-// repinAncestors bumps the LRU recency of every cached handle for a strict
-// ancestor (parent, grandparent, ...) of path, so a directory handle is not
-// evicted from under a child handle that is still being accessed. Ancestor ids
-// are gathered from the reverse-path map in O(path depth) rather than scanning
-// the whole handle cache. The reverse-map ids are collected under its read lock
-// and the lock is released before touching activeHandles, preserving the
-// activeHandles -> reverseHandlesMu lock order used by ToHandle's eviction
-// callback.
+// repinAncestors bumps the LRU recency of every cached handle for an ancestor
+// (root, parent, grandparent, ...) of path, so a directory handle is not evicted
+// from under a child handle that is still being accessed. Ancestor ids are
+// gathered from the reverse-path map in O(path depth) rather than scanning the
+// whole handle cache. The reverse-map ids are collected under its read lock and
+// the lock is released before touching activeHandles, preserving the activeHandles
+// -> reverseHandlesMu lock order used by ToHandle's eviction callback.
 func (c *CachingHandler) repinAncestors(f billy.Filesystem, path []string) {
-	if len(path) <= 1 {
-		return
-	}
-
 	c.reverseHandlesMu.RLock()
 	var ids []uuid.UUID
-	for i := 1; i < len(path); i++ {
+	for i := 0; i < len(path); i++ {
 		ancestor := f.Join(path[:i]...)
 		ids = append(ids, c.reverseHandles[ancestor]...)
 	}
@@ -171,7 +166,6 @@ func (c *CachingHandler) repinAncestors(f billy.Filesystem, path []string) {
 		_, _ = c.activeHandles.Get(id)
 	}
 }
-
 
 // allocating or publishing a new one, or nil if none is currently cached. It
 // lets handle-mutating ops (RENAME) invalidate cached fds for a path without the
