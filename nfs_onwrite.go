@@ -30,6 +30,11 @@ type writeArgs struct {
 }
 
 func onWrite(ctx context.Context, w *response, userHandle Handler) error {
+	writeStart := time.Now()
+	defer func() {
+		writeProfile.writes.Add(1)
+		writeProfile.totalNs.Add(time.Since(writeStart).Nanoseconds())
+	}()
 	w.errorFmt = wccDataErrorFormatter
 	var req writeArgs
 	if err := xdr.Read(w.req.Body, &req); err != nil {

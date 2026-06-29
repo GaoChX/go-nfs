@@ -65,7 +65,9 @@ func (h *cachedHandle) writeAt(data []byte, offset int64) (int, error) {
 		if h.closed {
 			return 0, errHandleClosed
 		}
+		start := time.Now()
 		n, err := wa.WriteAt(data, offset)
+		writeProfile.recordBackendWrite(time.Since(start).Nanoseconds(), n)
 		if n > 0 {
 			h.markDirty()
 		}
@@ -82,7 +84,9 @@ func (h *cachedHandle) writeAt(data []byte, offset int64) (int, error) {
 	if _, err := h.file.Seek(offset, io.SeekStart); err != nil {
 		return 0, err
 	}
+	start := time.Now()
 	n, err := h.file.Write(data)
+	writeProfile.recordBackendWrite(time.Since(start).Nanoseconds(), n)
 	if n > 0 {
 		h.markDirty()
 	}
