@@ -37,8 +37,11 @@ func onWrite(ctx context.Context, w *response, userHandle Handler) error {
 	}()
 	w.errorFmt = wccDataErrorFormatter
 	var req writeArgs
-	if err := xdr.Read(w.req.Body, &req); err != nil {
-		return &NFSStatusError{NFSStatusInval, err}
+	decodeStart := time.Now()
+	derr := xdr.Read(w.req.Body, &req)
+	writeProfile.decodeNs.Add(time.Since(decodeStart).Nanoseconds())
+	if derr != nil {
+		return &NFSStatusError{NFSStatusInval, derr}
 	}
 
 	fhStart := time.Now()
@@ -101,7 +104,9 @@ func onWrite(ctx context.Context, w *response, userHandle Handler) error {
 	writeProfile.preStatNs.Add(time.Since(preStatStart).Nanoseconds())
 
 	var h *cachedHandle
+	cwStart := time.Now()
 	writtenCount, h, err = cachedWrite(w, fs, req.Handle, fullPath, req.Data[:end], int64(req.Offset), cached)
+	writeProfile.cachedWriteNs.Add(time.Since(cwStart).Nanoseconds())
 	if err != nil {
 		Log.Errorf("Error writing: %v", err)
 		return &NFSStatusError{statusFromWriteError(err), err}
@@ -167,6 +172,7 @@ func onWrite(ctx context.Context, w *response, userHandle Handler) error {
 	}
 	writeProfile.postStatNs.Add(time.Since(postStatStart).Nanoseconds())
 
+	replyStart := time.Now()
 	writer := bytes.NewBuffer([]byte{})
 	if err := xdr.Write(writer, uint32(NFSStatusOk)); err != nil {
 		return &NFSStatusError{NFSStatusServerFault, err}
@@ -188,6 +194,7 @@ func onWrite(ctx context.Context, w *response, userHandle Handler) error {
 	if err := w.Write(writer.Bytes()); err != nil {
 		return &NFSStatusError{NFSStatusServerFault, err}
 	}
+	writeProfile.replyNs.Add(time.Since(replyStart).Nanoseconds())
 	return nil
 }
 

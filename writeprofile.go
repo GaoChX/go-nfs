@@ -27,6 +27,9 @@ type writeProfileT struct {
 	fromHandleNs atomic.Int64 // cumulative ns in userHandle.FromHandle
 	preStatNs    atomic.Int64 // cumulative ns building the pre-op wcc (fstat/path stat)
 	postStatNs   atomic.Int64 // cumulative ns building the post-op attrs (fstat/path stat)
+	decodeNs     atomic.Int64 // cumulative ns in xdr.Read decoding the request (incl. data)
+	replyNs      atomic.Int64 // cumulative ns building+queueing the reply
+	cachedWriteNs atomic.Int64 // cumulative ns in cachedWrite (incl. backend write)
 }
 
 var writeProfile writeProfileT
@@ -70,6 +73,9 @@ func init() {
 			"avg_fromhandle_ms":  avg(writeProfile.fromHandleNs.Load(), writes),
 			"avg_prestat_ms":     avg(writeProfile.preStatNs.Load(), writes),
 			"avg_poststat_ms":    avg(writeProfile.postStatNs.Load(), writes),
+			"avg_decode_ms":      avg(writeProfile.decodeNs.Load(), writes),
+			"avg_reply_ms":       avg(writeProfile.replyNs.Load(), writes),
+			"avg_cachedwrite_ms": avg(writeProfile.cachedWriteNs.Load(), writes),
 			"max_backend_ms":     float64(writeProfile.backendMax.Load()) / 1e6,
 			"backend_frac":       fracOf(backend, total),
 			"bytes":              writeProfile.bytesWrote.Load(),
