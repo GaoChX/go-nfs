@@ -45,9 +45,26 @@ type writeProfileT struct {
 	backendLt100ms atomic.Int64 // 10–100ms
 	backendLt1s    atomic.Int64 // 100ms–1s
 	backendGe1s    atomic.Int64 // >= 1s
+
+	// rawBackend* measure the innermost write syscall only, recorded by the
+	// backend (e.g. e2b's chroot wrappedFile) via RecordRawBackendWrite. backend*
+	// above times the WriteAt as go-nfs sees it — through the full FS wrapper
+	// chain — so (avg_backend - avg_raw_backend) is the per-write overhead added
+	// by those wrappers (metrics/tracing/logging spans, uuids, etc.).
+	rawBackendNs    atomic.Int64
+	rawBackendCount atomic.Int64
 }
 
 var writeProfile writeProfileT
+
+// RecordRawBackendWrite records the duration of the innermost backend write
+// syscall (nanoseconds), called by the backing filesystem just around its real
+// write/pwrite. Compared against the WriteAt time go-nfs measures, it isolates
+// the cost added by intervening billy.File wrappers. Safe for concurrent use.
+func RecordRawBackendWrite(ns int64) {
+	writeProfile.rawBackendNs.Add(ns)
+	writeProfile.rawBackendCount.Add(1)
+}
 
 // recordBackendWrite adds one backend write sample (the WriteAt/Write syscall to
 // the backing FS).
@@ -140,6 +157,8 @@ func init() {
 			"backend_10_100ms":              writeProfile.backendLt100ms.Load(),
 			"backend_100ms_1s":              writeProfile.backendLt1s.Load(),
 			"backend_ge1s":                  writeProfile.backendGe1s.Load(),
+			"avg_raw_backend_ms":            avg(writeProfile.rawBackendNs.Load(), writeProfile.rawBackendCount.Load()),
+			"raw_backend_count":             writeProfile.rawBackendCount.Load(),
 			"bytes":                         writeProfile.bytesWrote.Load(),
 			"syncs":                         syncs,
 			"avg_sync_ms":                   avg(syncNs, syncs),
