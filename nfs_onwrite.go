@@ -3,9 +3,11 @@ package nfs
 import (
 	"bytes"
 	"context"
-	"io"
+	"errors"
 	"math"
 	"os"
+	"syscall"
+	"time"
 
 	"github.com/go-git/go-billy/v5"
 	"github.com/willscott/go-nfs-client/nfs/xdr"
@@ -49,42 +51,143 @@ func onWrite(ctx context.Context, w *response, userHandle Handler) error {
 		return &NFSStatusError{NFSStatusInval, os.ErrInvalid}
 	}
 
-	// stat first for pre-op wcc.
 	fullPath := fs.Join(path...)
-	info, err := fs.Stat(fullPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return &NFSStatusError{NFSStatusNoEnt, err}
-		}
-		return &NFSStatusError{NFSStatusAccess, err}
-	}
-	if !info.Mode().IsRegular() {
-		return &NFSStatusError{NFSStatusInval, os.ErrInvalid}
-	}
-	preOpCache := ToFileAttribute(info, fullPath).AsCache()
-
-	// now the actual op.
-	file, err := fs.OpenFile(fs.Join(path...), os.O_RDWR, info.Mode().Perm())
-	if err != nil {
-		return &NFSStatusError{NFSStatusAccess, err}
-	}
-	if req.Offset > 0 {
-		if _, err := file.Seek(int64(req.Offset), io.SeekStart); err != nil {
-			return &NFSStatusError{NFSStatusIO, err}
-		}
-	}
 	end := req.Count
 	if len(req.Data) < int(end) {
 		end = uint32(len(req.Data))
 	}
-	writtenCount, err := file.Write(req.Data[:end])
+
+	// All writes reuse a per-file-handle cached open fd, so a run of writes to
+	// the same file pays one open instead of open+write+close per request, and
+	// the wcc attributes come from an fstat on that fd (a direct syscall) rather
+	// than the backing filesystem's potentially serialized path stat.
+	//
+	// The only difference by stability: unstable writes return without flushing
+	// (durability deferred to COMMIT), while dataSync/fileSync writes Sync the fd
+	// before replying so their durability contract is honored immediately. Both
+	// keep the fd open.
+	var (
+		writtenCount int
+		stability    = writeStability(req.How)
+		preOpCache   *FileCacheAttribute
+		postOp       *FileAttribute
+	)
+
+	// Pre-op wcc attributes are an optional optimization in NFSv3 (the wcc_attr
+	// "before" field MAY be omitted). Sample them only from an already-open
+	// cached fd, which fstats the fd directly (cheap, no path resolution). On a
+	// cold write (no cached handle yet) we deliberately SKIP the pre-op attrs
+	// rather than do a path Stat: on the e2b chroot backend a path Stat is
+	// funneled through a single-threaded mount-namespace executor (mountNS.Do),
+	// which serializes every WRITE and is the dominant cost under load. Existence
+	// and writability are still enforced — cachedWrite opens the file O_RDWR and
+	// fails cleanly if it is missing or not writable — and regular-file type is
+	// re-checked from the opened fd below.
+	cached := w.writeHandleCache().get(string(req.Handle))
+	if cached != nil {
+		if fi, ok := cached.stat(); ok {
+			preOpCache = ToFileAttribute(fi, fullPath).AsCache()
+		}
+	}
+
+	// Capture the write verifier BEFORE the write can be lost. Once cachedWrite
+	// has placed bytes in the fd, a concurrent eviction whose close-flush fails
+	// can rotate the server verifier (rotateWriteVerifier via the commit
+	// tracker's loss callback). If we read the verifier at reply-build time
+	// instead, a successful UNSTABLE WRITE whose data belonged to the lost
+	// generation could be stamped with the NEW verifier — making a later COMMIT
+	// that returns the same new verifier compare equal, so the client never
+	// replays the lost data. Stamping the pre-write verifier keeps that
+	// comparison mismatched, preserving the replay safety net.
+	verifier := w.Server.currentWriteVerifier()
+
+	var h *cachedHandle
+	writtenCount, h, err = cachedWrite(w, fs, req.Handle, fullPath, path, req.Data[:end], int64(req.Offset), cached)
 	if err != nil {
 		Log.Errorf("Error writing: %v", err)
 		return &NFSStatusError{statusFromWriteError(err), err}
 	}
-	if err := file.Close(); err != nil {
-		Log.Errorf("error closing: %v", err)
-		return &NFSStatusError{statusFromWriteError(err), err}
+
+	// Invalidate any cached read-only fd for this file (across connections): a
+	// read fd opened before this write reads a pre-write image on snapshot/
+	// buffered backends, so a later READ reusing it could return stale bytes even
+	// though the write reached the backend. Dropping only the read cache (not the
+	// write handle) forces the next READ to reopen while the run of unstable
+	// writes keeps reusing its write fd. A no-op map lookup when nothing is cached
+	// (the common write-only case), and a read-fd close failure is logged but does
+	// not fail the already-successful WRITE.
+	if rerr := w.Server.dropReadHandleAll(req.Handle); rerr != nil {
+		Log.Errorf("Error dropping read handle after write: %v", rerr)
+	}
+
+	// For dataSync/fileSync, flush before replying. Sync keeps the fd open;
+	// closeFlush is the fallback when the backing file cannot Sync. Either way
+	// we report fileSync, which is a valid upgrade of the requested stability.
+	if req.How != uint32(unstable) {
+		synced, serr := h.sync()
+		switch {
+		case errors.Is(serr, errHandleClosed):
+			// A concurrent drop/eviction (SETATTR/REMOVE/RENAME on another
+			// connection) closed the fd between our write and this sync. That close
+			// also flushed our write, but it may have failed (ENOSPC/EIO), which the
+			// drop records on the mount-wide tracker. A stable WRITE must honor
+			// durability now — its client will not send a COMMIT to learn of a
+			// deferred failure — so wait for the in-flight close and surface any
+			// recorded loss instead of assuming the data is durable.
+			if cerr := w.Server.commitsTracker().wait(string(req.Handle)); cerr != nil {
+				Log.Errorf("Error flushing on concurrent close: %v", cerr)
+				return &NFSStatusError{statusFromWriteError(cerr), cerr}
+			}
+		case serr != nil:
+			Log.Errorf("Error syncing: %v", serr)
+			return &NFSStatusError{statusFromWriteError(serr), serr}
+		case !synced:
+			// No Sync() capability: close to force a flush, recording any lost-dirty
+			// failure on the tracker (see flushHandle) before reporting it to this
+			// client. Close the handle removeAndTrack actually detached, not the
+			// possibly-replaced h, and use evictFlush so only a still-dirty close
+			// failure counts as a loss.
+			if dropped, done := w.writeHandleCache().removeAndTrack(string(req.Handle)); dropped != nil {
+				lost, cerr := dropped.evictFlush()
+				w.Server.commitsTracker().finish(string(req.Handle), done, lostErr(lost, cerr))
+				if cerr != nil {
+					Log.Errorf("Error flushing on close: %v", cerr)
+					return &NFSStatusError{statusFromWriteError(cerr), cerr}
+				}
+			}
+			// The handle we synced may have been concurrently closed (its failed
+			// close recorded on the tracker) and a fresh handle cached for the same
+			// key before removeAndTrack — so the handle we just closed above is not
+			// the one that held our bytes, and its clean close says nothing about
+			// their durability. A stable WRITE is the durability checkpoint (its
+			// dataSync/fileSync client will not send a COMMIT to learn of a deferred
+			// failure), so always consult the tracker and surface any recorded loss
+			// before acknowledging durability. wait blocks for any in-flight close.
+			if cerr := w.Server.commitsTracker().wait(string(req.Handle)); cerr != nil {
+				Log.Errorf("Error flushing on concurrent close: %v", cerr)
+				return &NFSStatusError{statusFromWriteError(cerr), cerr}
+			}
+		}
+		stability = fileSync
+	}
+
+	// Build post-op attributes. Prefer the handle's locally-tracked attributes
+	// (cached immutable fstat fields + high-water size + now mtime), which avoids
+	// an fstat through the FUSE + wrapper chain on every WRITE. On the first
+	// write to a freshly-opened handle nothing is cached yet, so fall back to a
+	// real fd fstat — which also caches the immutable fields for subsequent
+	// writes and serves as the regular-file-type guard that the (now skipped)
+	// pre-op path Stat used to provide: a WRITE to a directory/device is rejected
+	// here from the fd's mode, without a path Stat.
+	if fi, ok := h.postOpInfo(); ok {
+		postOp = ToFileAttribute(fi, fullPath)
+	} else if fi, ok := h.stat(); ok {
+		if !fi.Mode().IsRegular() {
+			return &NFSStatusError{NFSStatusInval, os.ErrInvalid}
+		}
+		postOp = ToFileAttribute(fi, fullPath)
+	} else {
+		postOp = tryStat(fs, path)
 	}
 
 	writer := bytes.NewBuffer([]byte{})
@@ -92,16 +195,16 @@ func onWrite(ctx context.Context, w *response, userHandle Handler) error {
 		return &NFSStatusError{NFSStatusServerFault, err}
 	}
 
-	if err := WriteWcc(writer, preOpCache, tryStat(fs, path)); err != nil {
+	if err := WriteWcc(writer, preOpCache, postOp); err != nil {
 		return &NFSStatusError{NFSStatusServerFault, err}
 	}
 	if err := xdr.Write(writer, uint32(writtenCount)); err != nil {
 		return &NFSStatusError{NFSStatusServerFault, err}
 	}
-	if err := xdr.Write(writer, fileSync); err != nil {
+	if err := xdr.Write(writer, stability); err != nil {
 		return &NFSStatusError{NFSStatusServerFault, err}
 	}
-	if err := xdr.Write(writer, w.Server.ID); err != nil {
+	if err := xdr.Write(writer, verifier); err != nil {
 		return &NFSStatusError{NFSStatusServerFault, err}
 	}
 
@@ -109,4 +212,120 @@ func onWrite(ctx context.Context, w *response, userHandle Handler) error {
 		return &NFSStatusError{NFSStatusServerFault, err}
 	}
 	return nil
+}
+
+// cachedWrite writes through a per-file-handle cached, kept-open fd. Unstable
+// writes are made durable later by onCommit (or the idle sweeper); dataSync/
+// fileSync writes are flushed by the caller via the returned handle. It returns
+// the handle so the caller can fstat it for post-op attributes.
+//
+// cachedHint is a handle the caller already looked up for this key (e.g. for the
+// pre-op wcc fstat); when non-nil it seeds the first attempt so the common
+// already-cached path takes the writeCache lock once instead of twice per WRITE.
+// It is only a hint: if it was closed by a concurrent eviction, writeAt reports
+// errHandleClosed and the retry re-fetches under the lock exactly as a cold call
+// would, so correctness does not depend on the hint being live.
+func cachedWrite(w *response, fs billy.Filesystem, handle []byte, fullPath string, path []string, data []byte, offset int64, cachedHint *cachedHandle) (int, *cachedHandle, error) {
+	cache := w.writeHandleCache()
+	key := string(handle)
+
+	// Retry once: the cached handle may be closed by eviction between lookup
+	// and write.
+	for attempt := 0; attempt < 2; attempt++ {
+		h := cache.getCurrent(key, cachedHint)
+		cachedHint = nil // only valid for the first attempt; re-fetch on retry
+		if h == nil {
+			// Sample this key's invalidation generation BEFORE opening: if a
+			// concurrent SETATTR/REMOVE/RENAME/CREATE drops the handle (bumping the
+			// key's gen) while we are mid-open, putIfFresh refuses to cache this
+			// now-stale fd — opened under the old mode/size — so later writes cannot
+			// reuse it to bypass a chmod or re-extend past a truncate. Per-key gen, so
+			// an unrelated file's invalidation does not refuse this open. sampleGen
+			// must be paired with exactly one resolveGen on every exit below.
+			gen := cache.sampleGen(key)
+			// O_RDWR on an existing file; perm is ignored without O_CREATE.
+			file, err := fs.OpenFile(fullPath, os.O_RDWR, 0)
+			if err != nil {
+				cache.resolveGen(key)
+				// A directory (and some special files) cannot be opened O_RDWR. Most
+				// backends report EISDIR (mapped to NFS3ERR_ISDIR), but some — e.g.
+				// helpers/memfs — return a plain unwrapped error that would otherwise
+				// fall through to a generic NFSStatusIO. Classify a directory target
+				// here so the client sees the same client-facing status regardless of
+				// backend. This Stat runs only on the rare open-failure path, not the
+				// hot path.
+				if !errors.Is(err, syscall.EISDIR) {
+					if fi, serr := fs.Stat(fullPath); serr == nil && fi.IsDir() {
+						return 0, nil, errNotRegular
+					}
+				}
+				return 0, nil, err
+			}
+
+			// Cold-open type guard, BEFORE publishing the fd. The pre-op path Stat
+			// that used to reject a non-regular target (directory, device, FIFO,
+			// socket) before opening was removed for performance, so validate the
+			// freshly-opened fd's type here instead — while it is still private, so a
+			// concurrent worker cannot retrieve it from the cache and writeAt a
+			// device/special file in the window before the check. A directory open
+			// fails earlier (EISDIR), but a device/FIFO/socket can open O_RDWR and a
+			// write to it would have a real side effect.
+			//
+			// Prefer an fstat on our own fd (a direct syscall that does not touch the
+			// backend's serialized metadata path); fall back to one path Stat for
+			// backends whose billy.File does not expose Stat (e.g. stock osfs), so the
+			// guard still holds there rather than silently writing a special file.
+			if !isRegularForWrite(fs, file, path) {
+				_ = file.Close()
+				cache.resolveGen(key)
+				return 0, nil, errNotRegular
+			}
+
+			h = &cachedHandle{file: file, lastUsed: time.Now()}
+			published := cache.putIfFresh(key, h, gen)
+			cache.resolveGen(key)
+			if !published {
+				// An invalidation raced our open, or another goroutine published
+				// first. Close our stale fd and retry: the next iteration either
+				// reuses the winner's handle or reopens under the new attributes.
+				_ = h.closeFlush()
+				continue
+			}
+		}
+
+		n, err := h.writeAt(data, offset)
+		if errors.Is(err, errHandleClosed) {
+			// Our handle was closed by a concurrent eviction/invalidation. Drop it
+			// and retry — but only if it is still the cached handle for key: another
+			// WRITE may have published a fresh fd in the meantime, and removing that
+			// would leave its unstable writes unreachable to COMMIT/drain.
+			cache.removeIf(key, h)
+			continue
+		}
+
+		return n, h, err
+	}
+
+	return 0, nil, errHandleClosed
+}
+
+// isRegularForWrite reports whether a freshly-opened WRITE target is a regular
+// file, so a non-regular target (device, FIFO, socket) is rejected before any
+// write. It prefers an fstat on the open fd (a direct syscall, independent of
+// the backend's serialized metadata path); if the file does not expose Stat it
+// falls back to a single path Stat. When neither is available (no fd Stat and
+// the path Stat errors) it conservatively allows the write, matching the
+// pre-existing behavior for backends that cannot report type — the write itself
+// still fails for a target that cannot accept positional writes.
+func isRegularForWrite(fs billy.Filesystem, file billy.File, path []string) bool {
+	if s, ok := file.(statter); ok {
+		if fi, err := s.Stat(); err == nil {
+			return fi.Mode().IsRegular()
+		}
+	}
+	if fi, err := fs.Stat(fs.Join(path...)); err == nil {
+		return fi.Mode().IsRegular()
+	}
+
+	return true
 }

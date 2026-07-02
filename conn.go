@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 
 	xdr2 "github.com/rasky/go-xdr/xdr2"
 	"github.com/willscott/go-nfs-client/nfs/rpc"
@@ -40,6 +41,182 @@ type conn struct {
 	*Server
 	writeSerializer chan []byte
 	net.Conn
+
+	// Per-connection handle caches. An NFS mount maps to a connection, so these
+	// are drained when the client disconnects (see serve), releasing fds
+	// promptly instead of waiting for the idle sweeper. cacheMu guards the
+	// pointers because broadcast invalidation (Server.dropHandleAll) reads them
+	// from other connections' goroutines while this connection may be lazily
+	// creating them on its first READ/WRITE.
+	cacheMu sync.Mutex
+	wc      *writeCache
+	rc      *readCache
+}
+
+// writeHandleCache returns the connection's unstable-write handle cache,
+// creating it on first use.
+func (c *conn) writeHandleCache() *writeCache {
+	c.cacheMu.Lock()
+	defer c.cacheMu.Unlock()
+
+	if c.wc == nil {
+		c.wc = newWriteCache(c.Server.commitsTracker())
+	}
+
+	return c.wc
+}
+
+// readHandleCache returns the connection's read handle cache, creating it on
+// first use.
+func (c *conn) readHandleCache() *readCache {
+	c.cacheMu.Lock()
+	defer c.cacheMu.Unlock()
+
+	if c.rc == nil {
+		c.rc = newReadCache()
+	}
+
+	return c.rc
+}
+
+// dropHandle flushes/closes any cached write and read handles for the given NFS
+// file handle. Safe to call from another connection's goroutine (broadcast
+// invalidation), so the cache pointers are read under cacheMu.
+func (c *conn) dropHandle(handle []byte) error {
+	c.cacheMu.Lock()
+	wc, rc := c.wc, c.rc
+	c.cacheMu.Unlock()
+
+	var err error
+	if wc != nil {
+		if h, done := wc.invalidate(string(handle)); h != nil {
+			// Use evictFlush, not closeFlush: like LRU/idle eviction this drop has
+			// no client to return a flush error to. If a still-dirty handle fails
+			// to close (ENOSPC/EIO), record it on the mount-wide tracker so a later
+			// COMMIT for this file (possibly on a peer connection) surfaces it
+			// instead of falsely succeeding via commitByPath.
+			lost, cerr := h.evictFlush()
+			wc.commits.finish(string(handle), done, lostErr(lost, cerr))
+			err = cerr
+		}
+	}
+	if rc != nil {
+		if h := rc.invalidate(string(handle)); h != nil {
+			if cerr := h.close(); cerr != nil && err == nil {
+				err = cerr
+			}
+		}
+	}
+
+	return err
+}
+
+// flushHandle flushes (without closing) any cached write handle for the given
+// NFS handle so its unstable writes reach stable storage, keeping the fd open
+// for further writes. Falls back to close (which also flushes) when the backing
+// file cannot Sync. Safe to call from another connection's goroutine (COMMIT
+// broadcast), so the cache pointer is read under cacheMu. Returns whether a
+// cached handle was found, so the caller can decide whether a path-level fsync
+// fallback is still needed.
+func (c *conn) flushHandle(handle []byte) (bool, error) {
+	c.cacheMu.Lock()
+	wc := c.wc
+	c.cacheMu.Unlock()
+
+	if wc == nil {
+		return false, nil
+	}
+
+	h := wc.get(string(handle))
+	if h == nil {
+		return false, nil
+	}
+
+	synced, err := h.sync()
+	if err != nil {
+		// A handle closed by a concurrent eviction was already flushed on close,
+		// so its writes are durable; only surface real sync failures.
+		if errors.Is(err, errHandleClosed) {
+			return true, nil
+		}
+		return true, err
+	}
+	if !synced {
+		// No Sync() capability: close to force a flush, then drop so the next
+		// write reopens. removeAndTrack publishes a pending marker before the
+		// handle leaves the cache, and finish records a lost-dirty close failure on
+		// the mount-wide tracker: this COMMIT returns the error now, but the handle
+		// is gone, so a retried COMMIT (or a retry after a lost error response) must
+		// still surface the loss via the tracker instead of falsely succeeding
+		// through commitByPath. Close the handle removeAndTrack actually detached:
+		// a concurrent eviction+rewrite may have replaced the one we synced, and
+		// closing the stale h would leave the live handle open, dirty, and
+		// unreachable. evictFlush records a loss only when the closed handle was
+		// still dirty.
+		if dropped, done := wc.removeAndTrack(string(handle)); dropped != nil {
+			lost, cerr := dropped.evictFlush()
+			c.Server.commitsTracker().finish(string(handle), done, lostErr(lost, cerr))
+			if cerr != nil {
+				return true, cerr
+			}
+		}
+	}
+
+	return true, nil
+}
+
+// flushDirtyHandle flushes this connection's cached write handle for the given
+// NFS handle only if it holds unflushed unstable writes, so a READ served from
+// a separate read-only fd observes them on backends that buffer until Sync/
+// Close. Safe to call from another connection's goroutine (READ broadcast), so
+// the cache pointer is read under cacheMu. Returns whether a dirty handle was
+// found and flushed.
+func (c *conn) flushDirtyHandle(handle []byte) (bool, error) {
+	c.cacheMu.Lock()
+	wc := c.wc
+	c.cacheMu.Unlock()
+
+	if wc == nil {
+		return false, nil
+	}
+
+	return wc.flushDirty(string(handle))
+}
+
+// dropReadHandle invalidates any cached read-only fd for the given NFS handle,
+// WITHOUT touching the cached write handle. Called after a successful WRITE so a
+// read-only fd opened before the write (which on snapshot/buffered backends
+// reads a pre-write image) is not reused by a later READ; the next READ reopens
+// and sees the written bytes. The write handle is left in place so the run of
+// unstable writes keeps reusing one fd. Safe to call from another connection's
+// goroutine (broadcast), so the cache pointer is read under cacheMu.
+func (c *conn) dropReadHandle(handle []byte) error {
+	c.cacheMu.Lock()
+	rc := c.rc
+	c.cacheMu.Unlock()
+
+	if rc == nil {
+		return nil
+	}
+	if h := rc.invalidate(string(handle)); h != nil {
+		return h.close()
+	}
+
+	return nil
+}
+
+// drainCaches flushes and closes all cached handles for this connection.
+func (c *conn) drainCaches() {
+	c.cacheMu.Lock()
+	wc, rc := c.wc, c.rc
+	c.cacheMu.Unlock()
+
+	if wc != nil {
+		wc.Close()
+	}
+	if rc != nil {
+		rc.Close()
+	}
 }
 
 func (c *conn) serve(ctx context.Context) {
@@ -50,40 +227,128 @@ func (c *conn) serve(ctx context.Context) {
 		connCtx, c.Conn = hook(connCtx, c.Conn)
 	}
 
+	c.registerConn(c)
+
+	// inFlight tracks handler goroutines so teardown can wait for them before
+	// draining the caches (a worker may still hold a cached read/write fd).
+	var inFlight sync.WaitGroup
+	// cleanShutdown is set when the read loop stops on a clean client half-close
+	// (io.EOF at a record boundary) rather than an error. On a clean close the
+	// client may still be waiting to read replies for requests it pipelined before
+	// half-closing its write side, so teardown must let in-flight handlers finish
+	// and the serializer flush their replies before tearing down — NOT cancel them.
+	var cleanShutdown bool
+	// serializerDone is closed by the serializer goroutine when it returns, so
+	// teardown can wait for the final flush to complete before closing the socket.
+	serializerDone := make(chan struct{})
 	defer func() {
+		if cleanShutdown {
+			// Clean half-close: wait for in-flight handlers to hand their replies to
+			// the serializer (the channel is buffered to the worker limit, so their
+			// finish sends never block), then close the channel so the serializer
+			// drains everything buffered, flushes it to the socket, and exits. Only
+			// then close the socket and cancel — so no pipelined reply is dropped. The
+			// previous serial loop sent each reply before it ever read the EOF; this
+			// preserves that guarantee under concurrent handling.
+			inFlight.Wait()
+			close(c.writeSerializer)
+			<-serializerDone
+			// Close the socket AFTER the final flush: sends our FIN so a client that
+			// half-closed and is waiting to read EOF after its replies unblocks, and
+			// releases the fd (otherwise a cleanly-disconnected peer would linger in
+			// CLOSE_WAIT and leak the descriptor). The old EOF path closed here too.
+			c.Close()
+			cancel()
+		} else {
+			// Error/abnormal teardown: cancel to stop new work, then close the
+			// socket to unblock the serializer if it is stuck in a Write/Flush (the
+			// client stopped reading). Context cancellation does not interrupt blocking
+			// I/O; without closing the socket, serve can hang indefinitely before
+			// draining caches or unregistering. Once unblocked, wait for in-flight
+			// handlers to finish (they may still be touching handle caches) before
+			// draining.
+			cancel()
+			c.Close()
+			inFlight.Wait()
+			<-serializerDone
+		}
+		// Drain (close fds) before unregistering so a concurrent broadcast
+		// invalidation on another connection still visits this one while its
+		// cached fds are open; unregistering first would let a snapshot miss it
+		// and leave an fd open (failing Windows-like remove/rename).
+		c.drainCaches()
+		c.unregisterConn(c)
 		if hook := c.OnDisconnect; hook != nil {
 			hook(connCtx, c.Conn)
 		}
 	}()
 
-	c.writeSerializer = make(chan []byte, 1)
-	go c.serializeWrites(connCtx)
+	// Bound how many requests this connection processes concurrently. Reading is
+	// serial — one reader per socket pulls each RPC record off the wire in order —
+	// but handling (the disk IO) fans out to up to `limit` goroutines, so a run of
+	// pipelined requests on an nconnect mount no longer waits for each
+	// predecessor's IO to complete. This mirrors knfsd's pool of nfsd threads and
+	// nfs-ganesha's worker pool; replies are matched by XID and may return out of
+	// order, which the protocol allows.
+	limit := c.Server.MaxConcurrentRequests
+	if limit <= 0 {
+		limit = DefaultMaxConcurrentRequests
+	}
+	sem := make(chan struct{}, limit)
+
+	// Buffer the serializer to the concurrency limit so completed handlers can
+	// hand off their reply without blocking on the single socket writer.
+	c.writeSerializer = make(chan []byte, limit)
+	go func() {
+		defer close(serializerDone)
+		c.serializeWrites(connCtx)
+	}()
 
 	bio := bufio.NewReader(c.Conn)
 	for {
 		w, err := c.readRequestHeader(connCtx, bio)
 		if err != nil {
 			if err == io.EOF {
-				// Clean close.
-				c.Close()
-				return
+				// Clean half-close at a record boundary. Do NOT Close() the socket or
+				// cancel here: in-flight handlers for requests the client pipelined
+				// before half-closing may still be running, and the client is waiting
+				// to read their replies. Signal a clean shutdown so teardown waits for
+				// those handlers and lets the serializer flush their replies first.
+				cleanShutdown = true
 			}
 			return
 		}
 		Log.Tracef("request: %v", w.req)
-		err = c.handle(connCtx, w)
-		respErr := w.finish(connCtx)
-		if err != nil {
-			Log.Errorf("error handling req: %v", err)
-			// failure to handle at a level needing to close the connection.
-			c.Close()
+
+		// Acquire a worker slot (or bail out if the connection is tearing down).
+		select {
+		case sem <- struct{}{}:
+		case <-connCtx.Done():
 			return
 		}
-		if respErr != nil {
-			Log.Errorf("error sending response: %v", respErr)
-			c.Close()
-			return
-		}
+		inFlight.Add(1)
+		go func(w *response) {
+			defer inFlight.Done()
+			defer func() { <-sem }()
+			// The reply is built into w.writer (independent of the record buffer), so
+			// once handle returns nothing aliases req.Body and the buffer can go back
+			// to the pool for the next request to reuse.
+			defer w.release()
+
+			if err := c.handle(connCtx, w); err != nil {
+				Log.Errorf("error handling req: %v", err)
+				// Failure at a level needing the connection closed. Cancel to stop the
+				// serializer and Close to unblock the serial reader.
+				cancel()
+				c.Close()
+				return
+			}
+			if err := w.finish(connCtx); err != nil {
+				Log.Errorf("error sending response: %v", err)
+				cancel()
+				c.Close()
+			}
+		}(w)
 	}
 }
 
@@ -91,7 +356,24 @@ func (c *conn) serializeWrites(ctx context.Context) {
 	// todo: maybe don't need the extra buffer
 	writer := bufio.NewWriter(c.Conn)
 	var fragmentBuf [4]byte
-	var fragmentInt uint32
+
+	// writeMsg frames and writes one reply into the buffered writer (no flush).
+	writeMsg := func(msg []byte) bool {
+		fragmentInt := uint32(len(msg)) | (1 << 31)
+		binary.BigEndian.PutUint32(fragmentBuf[:], fragmentInt)
+		if n, err := writer.Write(fragmentBuf[:]); n < 4 || err != nil {
+			return false
+		}
+		n, err := writer.Write(msg)
+		if err != nil {
+			return false
+		}
+		if n < len(msg) {
+			panic("todo: ensure writes complete fully.")
+		}
+		return true
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -100,22 +382,29 @@ func (c *conn) serializeWrites(ctx context.Context) {
 			if !ok {
 				return
 			}
-			// prepend the fragmentation header
-			fragmentInt = uint32(len(msg))
-			fragmentInt |= (1 << 31)
-			binary.BigEndian.PutUint32(fragmentBuf[:], fragmentInt)
-			n, err := writer.Write(fragmentBuf[:])
-			if n < 4 || err != nil {
+			if !writeMsg(msg) {
 				return
 			}
-			n, err = writer.Write(msg)
-			if err != nil {
-				return
+			// Coalesce flushes: with concurrent handlers many replies queue up at
+			// once, so drain everything already buffered in the channel and flush a
+			// single time rather than paying a write syscall per reply. When idle the
+			// channel is empty after one message, so this still flushes immediately.
+			drained := false
+			for !drained {
+				select {
+				case msg, ok := <-c.writeSerializer:
+					if !ok {
+						drained = true
+						break
+					}
+					if !writeMsg(msg) {
+						return
+					}
+				default:
+					drained = true
+				}
 			}
-			if n < len(msg) {
-				panic("todo: ensure writes complete fully.")
-			}
-			if err = writer.Flush(); err != nil {
+			if err := writer.Flush(); err != nil {
 				return
 			}
 		}
@@ -197,6 +486,20 @@ type response struct {
 	err       error
 	errorFmt  func(error) RPCError
 	req       *request
+	// recordBuf is the pooled buffer backing req.Body, returned to the pool by
+	// release once handling completes (the reply is built in writer, which is
+	// independent, so the record bytes are no longer needed). nil for responses
+	// constructed in tests.
+	recordBuf *[]byte
+}
+
+// release returns the request's pooled record buffer. Safe to call once, after
+// the handler has finished consuming req.Body.
+func (w *response) release() {
+	if w.recordBuf != nil {
+		putRecordBuf(w.recordBuf)
+		w.recordBuf = nil
+	}
 }
 
 func (w *response) writeXdrHeader() error {
@@ -286,6 +589,53 @@ func (w *response) finish(ctx context.Context) error {
 	}
 }
 
+// maxRequestSize bounds a single RPC record's length. Reading concurrently
+// means up to MaxConcurrentRequests record buffers may be live at once, so an
+// unbounded (or merely large) length from the wire could exhaust memory: the
+// worst-case live footprint per connection is MaxConcurrentRequests *
+// maxRequestSize. The largest legitimate request is a WRITE carrying up to the
+// advertised wtmax (1 MiB, see onFSInfo) plus RPC/NFS headers; 2 MiB leaves
+// generous header headroom while bounding the per-connection worst case (e.g.
+// 64 * 2 MiB = 128 MiB), instead of the ~1 GiB-per-buffer a wtmax of 1<<30
+// allowed.
+const maxRequestSize = 2 << 20
+
+// maxPooledRecord caps the capacity of a record buffer returned to the pool.
+// Buffers grown to serve a large WRITE (up to wtmax) are not retained, so the
+// pool's idle footprint stays bounded by the common (small) request size rather
+// than the largest one ever seen.
+const maxPooledRecord = 1 << 20
+
+// recordBufPool recycles the per-request record buffers read off the wire.
+// ntirpc reuses a per-connection input stream (svc_vc's xdrs_in) to avoid
+// allocating a buffer per request; in Go a shared buffer would race the
+// concurrent workers, so each request instead borrows a buffer from this pool
+// and returns it once handling completes (response.release). Pooling *[]byte
+// (not []byte) avoids an allocation on every Put.
+var recordBufPool = sync.Pool{New: func() any { b := []byte(nil); return &b }}
+
+// getRecordBuf returns a buffer of length n, reusing a pooled one when large
+// enough.
+func getRecordBuf(n int) *[]byte {
+	bp := recordBufPool.Get().(*[]byte)
+	if cap(*bp) < n {
+		*bp = make([]byte, n)
+	} else {
+		*bp = (*bp)[:n]
+	}
+
+	return bp
+}
+
+// putRecordBuf returns a record buffer to the pool, dropping oversized ones so
+// idle memory is not pinned at the largest WRITE seen.
+func putRecordBuf(bp *[]byte) {
+	if bp == nil || cap(*bp) > maxPooledRecord {
+		return
+	}
+	recordBufPool.Put(bp)
+}
+
 func (c *conn) readRequestHeader(ctx context.Context, reader *bufio.Reader) (w *response, err error) {
 	fragment, err := xdr.ReadUint32(reader)
 	if err != nil {
@@ -304,34 +654,57 @@ func (c *conn) readRequestHeader(ctx context.Context, reader *bufio.Reader) (w *
 	if reqLen < 40 {
 		return nil, ErrInputInvalid
 	}
+	if reqLen > maxRequestSize {
+		return nil, ErrInputInvalid
+	}
 
-	r := io.LimitedReader{R: reader, N: int64(reqLen)}
-
-	xid, err := xdr.ReadUint32(&r)
-	if err != nil {
+	// Copy the whole record off the shared socket reader into a pooled private
+	// buffer before returning. Handlers run on worker goroutines concurrently
+	// with this loop reading the next record, so the body must NOT alias the
+	// shared bufio.Reader — each request owns its bytes (cf. knfsd's per-thread
+	// rq_arg, nfs-ganesha's per-connection xdrs_in). The buffer is returned to the
+	// pool by response.release once handling completes; xdr decodes opaque fields
+	// (handle/data) into fresh slices, so nothing aliases it after that. A short
+	// read mid-record is a truncated/closed connection, not a clean close.
+	bufp := getRecordBuf(int(reqLen))
+	if _, err := io.ReadFull(reader, *bufp); err != nil {
+		putRecordBuf(bufp)
 		return nil, err
 	}
-	reqType, err := xdr.ReadUint32(&r)
+	body := bytes.NewReader(*bufp)
+
+	xid, err := xdr.ReadUint32(body)
 	if err != nil {
+		putRecordBuf(bufp)
+		return nil, err
+	}
+	reqType, err := xdr.ReadUint32(body)
+	if err != nil {
+		putRecordBuf(bufp)
 		return nil, err
 	}
 	if reqType != 0 { // 0 = request, 1 = response
+		putRecordBuf(bufp)
 		return nil, ErrInputInvalid
 	}
 
 	req := request{
 		xid,
 		rpc.Header{},
-		&r,
+		// LimitedReader so response.drain's type assertion still applies; N is the
+		// bytes left after the header, i.e. the request body the handler consumes.
+		&io.LimitedReader{R: body, N: int64(body.Len())},
 	}
-	if err = xdr.Read(&r, &req.Header); err != nil {
+	if err = xdr.Read(req.Body, &req.Header); err != nil {
+		putRecordBuf(bufp)
 		return nil, err
 	}
 
 	w = &response{
-		conn:     c,
-		req:      &req,
-		errorFmt: basicErrorFormatter,
+		conn:      c,
+		req:       &req,
+		errorFmt:  basicErrorFormatter,
+		recordBuf: bufp,
 		// TODO: use a pool for these.
 		writer: bytes.NewBuffer([]byte{}),
 	}

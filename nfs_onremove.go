@@ -47,7 +47,17 @@ func onRemove(ctx context.Context, w *response, userHandle Handler) error {
 	toDelete := fs.Join(append(path, string(obj.Filename))...)
 	toDeleteHandle := userHandle.ToHandle(ctx, fs, append(path, string(obj.Filename)))
 
-	err = fs.Remove(toDelete)
+	// Close any cached read/write fd for this file before removing it, across
+	// all connections (another connection may hold its own fd). On POSIX this is
+	// unnecessary (unlink of an open file succeeds), but Windows and other
+	// backends refuse to delete a file that is still open, so a cached fd would
+	// make fs.Remove fail. Closing first also flushes any pending unstable
+	// writes, which is harmless for a file about to vanish. dropAndRetry guards
+	// the window between this drop and fs.Remove: if a racing READ/WRITE cached
+	// a fresh fd there, the removal is retried once after dropping again.
+	w.dropHandleAll(toDeleteHandle)
+
+	err = w.Server.dropAndRetry(func() error { return fs.Remove(toDelete) }, func() [][]byte { return [][]byte{toDeleteHandle} })
 	if err != nil {
 		if os.IsNotExist(err) {
 			return &NFSStatusError{NFSStatusNoEnt, err}
@@ -58,9 +68,16 @@ func onRemove(ctx context.Context, w *response, userHandle Handler) error {
 		return &NFSStatusError{NFSStatusIO, err}
 	}
 
+	// Invalidate the handler's path->handle mapping first, then drop. Once
+	// InvalidateHandle runs, FromHandle can no longer resolve the handle, so no
+	// further READ/WRITE can cache a new fd under it; the subsequent drop closes
+	// any fd cached in the window since the pre-remove snapshot (including the
+	// gap between fs.Remove and here). Dropping before invalidation would leave
+	// that gap's fd open until idle cleanup.
 	if err := userHandle.InvalidateHandle(ctx, fs, toDeleteHandle); err != nil {
 		return &NFSStatusError{NFSStatusServerFault, err}
 	}
+	w.dropHandleAll(toDeleteHandle)
 
 	writer := bytes.NewBuffer([]byte{})
 	if err := xdr.Write(writer, uint32(NFSStatusOk)); err != nil {

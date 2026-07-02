@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"os"
 	"syscall"
 )
 
@@ -243,6 +244,35 @@ func statusFromWriteError(err error) NFSStatus {
 	}
 	if errors.Is(err, syscall.EFBIG) {
 		return NFSStatusFBig
+	}
+	// A WRITE whose target does not exist surfaces here now that the WRITE path
+	// validates existence by opening the file (O_RDWR) rather than a pre-op path
+	// Stat. Map it to the NoEnt the pre-op Stat used to return instead of a
+	// generic I/O error.
+	if os.IsNotExist(err) {
+		return NFSStatusNoEnt
+	}
+	// A denied open of an existing file (read-only file, or permissions changed
+	// outside NFS) is a permission error, not generic I/O. os.IsPermission also
+	// catches the os.ErrPermission wrapper, so this works whether the backend
+	// returns a raw EACCES/EPERM or a *PathError.
+	if os.IsPermission(err) {
+		return NFSStatusAccess
+	}
+	// A WRITE whose target is a directory fails at OpenFile(O_RDWR) with EISDIR,
+	// before the cold-open type guard in cachedWrite can run, so map it here. The
+	// pre-op path Stat that used to reject a directory returned a client-facing
+	// status rather than a generic server I/O error; NFS3ERR_ISDIR is the
+	// spec-precise code for "target is a directory".
+	if errors.Is(err, syscall.EISDIR) {
+		return NFSStatusIsDir
+	}
+	// A WRITE whose target opened but is not a regular file (directory, device,
+	// FIFO, socket) is rejected by the cold-open type guard in cachedWrite, now
+	// that the pre-op path Stat that used to reject these is gone. It is a
+	// client/argument error, not generic I/O.
+	if errors.Is(err, errNotRegular) {
+		return NFSStatusInval
 	}
 	return NFSStatusIO
 }
